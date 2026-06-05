@@ -8,11 +8,11 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      BACKEND_IMAGE: prashanth1003/heygen-backend:latest
-      FRONTEND_IMAGE: prashanth1003/heygen-frontend:latest
+      BACKEND_IMAGE: ${{ secrets.DOCKER_USER }}/heygen-backend:latest
+      FRONTEND_IMAGE: ${{ secrets.DOCKER_USER }}/heygen-frontend:latest
       BACKEND_CONTAINER: heygen-backend
       FRONTEND_CONTAINER: heygen-frontend
-      CPAAS_API_BASE_URL: ${{ secrets.CPAAS_API_BASE_URL || 'https://api-resolve-x.credresolve.com' }}
+      CPAAS_API_BASE_URL: ${{ secrets.CPAAS_API_BASE_URL }}
 
     steps:
       - name: Checkout repo
@@ -44,11 +44,11 @@ jobs:
           username: ubuntu
           key: ${{ secrets.GIT_ACT_SSH_KEY_CR_STAGE }}
           script: |
-            ssh -o StrictHostKeyChecking=no -i ~/.ssh/credresolve-master-key.pem ubuntu@${{ secrets.GIT_ACT_STAGE_HOST }} "
+            ssh -o StrictHostKeyChecking=no -i ~/.ssh/deploy-key.pem ubuntu@${{ secrets.GIT_ACT_STAGE_HOST }} "
               set -e
 
               test -n '${{ secrets.FRONTEND_URL }}' &&
-              test -n '${{ env.CPAAS_API_BASE_URL }}' &&
+              test -n '${{ secrets.CPAAS_API_BASE_URL }}' &&
 
               echo '${{ secrets.DOCKER_PASS }}' | sudo docker login -u '${{ secrets.DOCKER_USER }}' --password-stdin &&
               
@@ -71,7 +71,7 @@ jobs:
                 --env AWS_REGION='${{ secrets.AWS_REGION }}' \
                 --env S3_BUCKET_NAME='${{ secrets.S3_BUCKET_NAME }}' \
                 --env FRONTEND_URL='${{ secrets.FRONTEND_URL }}' \
-                --env CPAAS_API_BASE_URL='${{ env.CPAAS_API_BASE_URL }}' \
+                --env CPAAS_API_BASE_URL='${{ secrets.CPAAS_API_BASE_URL }}' \
                 --env MEDHA_API_URL='${{ secrets.MEDHA_API_URL }}' \
                 --env MEDHA_API_KEY='${{ secrets.MEDHA_API_KEY }}' \
                 --env MEDHA_MODEL_NAME='${{ secrets.MEDHA_MODEL_NAME }}' \

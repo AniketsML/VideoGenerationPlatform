@@ -10,8 +10,8 @@ Every completed `loan_reminder` job can have two customer-facing URLs:
 
 | URL | Example | Purpose |
 |---|---|---|
-| `video_url` | `https://vishvarupa.../videos/<id>.mp4?...` | Raw MP4 from S3. Visual video only. No clickable CTA. |
-| `interactive_url` | `https://vishvarupa.../interactive/loan-reminder/<id>.html?...` | S3-hosted HTML player with video plus clickable Pay Now and Call buttons. |
+| `video_url` | `https://your-bucket.s3.amazonaws.com/videos/<id>.mp4` | Raw MP4 from S3. Visual video only. No clickable CTA. |
+| `interactive_url` | `https://your-app-domain.com/interactive/loan-reminder/<id>.html` | S3-hosted HTML player with video plus clickable Pay Now and Call buttons. |
 
 The share link for customers should be `interactive_url`, not `video_url`.
 

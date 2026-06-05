@@ -11,17 +11,17 @@ Accessed via the route: `GET /loan-offer/:video_id`
 Unlike standard video templates that return a single video link, the Interactive Loan Offer system utilizes a **dual-URL delivery model**:
 
 1. **`video_url` (S3 link)**: Points directly to the raw rendered `.mp4` video stored in the Amazon S3 bucket.
-   * *Example*: `https://vishvarupa-dev.s3.amazonaws.com/videos/6a0eb075b7ecb6342178e3a4.mp4`
+   * *Example*: `https://your-bucket.s3.amazonaws.com/videos/<video_id>.mp4`
    * *Purpose*: This file only contains the raw background animation and voice narration. It does NOT contain any overlays, dropdown sliders, pause behaviors, or interaction capabilities. If opened directly in a browser or VLC player, it behaves like a normal passive video.
 2. **`interactive_url` (Frontend link)**: The user-facing shareable link that routes to the React application's interactive page.
-   * *Example*: `https://vishvarupa.credresolve.com/loan-offer/6a0eb075b7ecb6342178e3a4`
+   * *Example*: `https://your-app-domain.com/loan-offer/<video_id>`
    * *Purpose*: This page loads the interactive framework (`InteractiveLoanOffer.tsx`), loads the raw background video from S3 via the API, parses the word-by-word subtitle timings, overlays the HTML selection cards/CTAs, tracks user events, and manages the interactive play/pause loops.
 
 ### Why do I see a 404 on the production domain for interactive videos, but other videos work normally?
 
 Because the **database and SQS queues are shared between the local and production environments**, when you test or trigger a video generation locally:
 1. The backend queues the video, generates it, uploads the raw `.mp4` to the S3 bucket, and marks the DB record status as `completed`.
-2. When querying the status, the backend builds the `interactive_url` using the target domain (e.g., `vishvarupa.credresolve.com`).
+2. When querying the status, the backend builds the `interactive_url` using the target domain (e.g., `your-app-domain.com`).
 3. Standard videos work fine on the production domain because they are accessed as direct S3 `.mp4` links (e.g., via the `video_url`).
 4. **However**, the interactive video requires the React routing system (`/loan-offer/:id`) to be present on the web server. If you have not yet built and deployed the updated React frontend code (which includes the new page route and styling for `InteractiveLoanOffer.tsx`) to the production web server, the web server's routing does not recognize the `/loan-offer/...` path and returns a `404 Not Found`.
 

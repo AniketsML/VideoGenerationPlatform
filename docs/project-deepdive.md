@@ -21,7 +21,7 @@ graph TD
     
     %% Backend Layer
     API -->|Auth & Metadata| DB[(MongoDB: heygen_db)]
-    API -->|Upload Assets| S3[AWS S3 Bucket: vishvarupa]
+    API -->|Upload Assets| S3[AWS S3 Bucket: your-s3-bucket]
     API -->|Enqueue Jobs| SQS[AWS SQS: Video-generation]
     
     %% Queue & Processing Layer
@@ -145,7 +145,7 @@ The system supports two HeyGen integration mechanisms, managed by `app/services/
         ├─► 3. Poll HeyGen /v1/video_status.get until "completed" (or timeout)
         ├─► 4. Download source MP4 locally
         ├─► 5. Execute MediaStylingService: Burn overlays (subtitles/logos) via FFmpeg
-        ├─► 6. S3 Service: Upload finalized MP4 to "vishvarupa" bucket
+        ├─► 6. S3 Service: Upload finalized MP4 to "your-s3-bucket" bucket
         ├─► 7. MongoDB: Update VideoRecord to "completed" with the S3 URL
         └─► 8. SQS Service: Delete SQS message
 ```

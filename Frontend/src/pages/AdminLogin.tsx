@@ -94,7 +94,7 @@ const AdminLogin = () => {
                 type="email"
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
-                placeholder="admin@credresolve.com"
+                placeholder="admin@example.com"
                 autoComplete="email"
                 required
                 className="bg-white"
