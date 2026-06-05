@@ -1,0 +1,79 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+/lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.env
+.venv
+.venv311/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Output
+output/
+generated/
+temp/
+
+# Node.js (for the wizard subfolder)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Remotion runtime artifacts
+Remotion/public/metadata.json
+Remotion/public/audio/*
+!Remotion/public/audio/.gitkeep
+Remotion/public/assets/*.vtt
+Remotion/out/
+Remotion/output.mp4
+
+# Temporary files and Debug Scripts
+scratch/
+scratch.py
+*.tmp
+*.swp
+*.mp3
+*debug*.py
+verify_server_avatars.py
+find_avatars.py
+find_voices*.py
+test_remotion.py
+lipsync_poc/
+
+# Remotion JSON artifacts
+Remotion/leads.json
+Remotion/props_*.json
+
+# Claude Code
+.claude/

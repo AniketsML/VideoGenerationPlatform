@@ -1,0 +1,51 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: personalized-video-backend
+    restart: unless-stopped
+    shm_size: 2gb
+    env_file:
+      - ./.env
+    environment:
+      FRONTEND_URL: ${FRONTEND_URL:?Set FRONTEND_URL in .env}
+      CPAAS_API_BASE_URL: ${CPAAS_API_BASE_URL:?Set CPAAS_API_BASE_URL in .env}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./input:/app/input
+      - ./output:/app/output
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: personalized-video-worker
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    environment:
+      FRONTEND_URL: ${FRONTEND_URL:?Set FRONTEND_URL in .env}
+      CPAAS_API_BASE_URL: ${CPAAS_API_BASE_URL:?Set CPAAS_API_BASE_URL in .env}
+    command: python -m app.workers.avatar_job_worker
+    depends_on:
+      - backend
+    volumes:
+      - ./input:/app/input
+      - ./output:/app/output
+
+  frontend:
+    build:
+      context: ./Frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: /api
+    container_name: personalized-video-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    environment:
+      BACKEND_ORIGIN: ${BACKEND_ORIGIN:-http://backend:8000}
+    ports:
+      - "8081:80"

@@ -1,0 +1,27 @@
+services:
+  backend:
+    image: ${BACKEND_IMAGE:?Set BACKEND_IMAGE before running docker compose}
+    container_name: personalized-video-backend
+    restart: unless-stopped
+    shm_size: 2gb
+    env_file:
+      - ./.env
+    environment:
+      FRONTEND_URL: ${FRONTEND_URL:?Set FRONTEND_URL in .env}
+      CPAAS_API_BASE_URL: ${CPAAS_API_BASE_URL:?Set CPAAS_API_BASE_URL in .env}
+    expose:
+      - "8000"
+    volumes:
+      - ./input:/app/input
+      - ./output:/app/output
+
+  frontend:
+    image: ${FRONTEND_IMAGE:?Set FRONTEND_IMAGE before running docker compose}
+    container_name: personalized-video-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    environment:
+      BACKEND_ORIGIN: ${BACKEND_ORIGIN:-http://backend:8000}
+    ports:
+      - "${FRONTEND_PORT:-80}:80"

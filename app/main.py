@@ -1,0 +1,3321 @@
+import asyncio
+import html
+import sys
+import hashlib
+import json
+import re
+import shutil
+from uuid import uuid4
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
+from typing import Any, Literal, Optional
+from datetime import datetime
+import time
+from pathlib import Path
+from zoneinfo import ZoneInfo
+from bson import ObjectId
+
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, Depends, Query, status, Body
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.security import OAuth2PasswordRequestForm
+from pydantic import BaseModel, ValidationError
+
+from app.config import settings
+from app.constants import SQS_QUEUE_URL
+from app.models import (
+    AvatarJobAck,
+    AvatarJobStatusResponse,
+    DirectVideoRequest,
+    HybridRemotionAvatarPipRequest,
+    HybridRemotionAvatarPipResponse,
+    RemotionVideoRequest,
+    StyledVideoResult,
+    TemplateVideoRequest,
+    VideoJobResult,
+    UserCreate,
+    Token,
+    UserInDB,
+    User,
+    VideoRecord,
+)
+from app.services.heygen_client import HeyGenClient
+from app.services.media_styling_service import MediaStylingService, StyleRequest
+from app.services.remotion_service import RemotionService
+from app.services.hybrid_remotion_avatar_pip_service import (
+    HybridAvatarGenerationError,
+    HybridRenderError,
+    generate_raw_avatar_for_hybrid,
+    render_hybrid_avatar_pip_video,
+)
+from app.services.sqs_service import SQSService
+from app.services.video_service import VideoService
+from app.services.s3_service import S3Service
+from app.database import users_collection, videos_collection, drafts_collection, custom_avatars_collection, whatsapp_templates_collection
+from app.auth import get_password_hash, verify_password, create_access_token, get_current_user, get_current_admin
+from app.workers.avatar_job_worker import AvatarJobWorker
+from app.workers.remotion_job_worker import RemotionJobWorker
+from app.services.pdf_service import PDFService
+from app.services.summarization_service import SummarizationService
+from app.services.audio_service import audio_service
+from app.models import PDFRecord
+
+import logging
+
+logger = logging.getLogger("app")
+logger.setLevel(logging.INFO)
+
+formatter = logging.Formatter(
+    "%(asctime)s | %(levelname)s | %(message)s"
+)
+
+IST = ZoneInfo("Asia/Kolkata")
+
+
+def now_ist() -> datetime:
+    return datetime.now(IST)
+
+SAMPLE_BULK_CSV_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "Remotion"
+    / "public"
+    / "assets"
+    / "sample.csv"
+)
+
+app = FastAPI(title='Personalized Video Generator', version='1.0.0')
+settings.output_dir.mkdir(parents=True, exist_ok=True)
+(settings.output_dir / "text-videos").mkdir(parents=True, exist_ok=True)
+(settings.output_dir / "avatar-videos").mkdir(parents=True, exist_ok=True)
+HYBRID_PUBLIC_DIR = Path("/tmp/hybrid-public")
+HYBRID_PUBLIC_DIR.mkdir(parents=True, exist_ok=True)
+PORTRAIT_REMOTION_TEMPLATE_KEYS = {"payment_link_guidance", "overdue_template", "loan_offer_interactive", "scene_loan_offer"}
+LOCAL_REMOTION_WORKER_TEMPLATE_KEYS = {"payment_link_guidance", "loan_offer_interactive", "loan_reminder", "scene_loan_offer", "tvs_credit_emi"}
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_credentials=True,
+    allow_methods=['*'],
+    allow_headers=['*'],
+)
+
+
+async def poll_sqs():
+    print("Starting SQS Worker...")
+    try:
+        # AvatarJobWorker already internally ignores 'remotion' jobs properly now.
+        # Starting independent workers gracefully...
+
+        await asyncio.gather(
+            AvatarJobWorker().run_forever(),
+            RemotionJobWorker().run_forever()
+        )
+    except Exception as e:
+        logger.error(f"SQS Worker crashed: {e}")
+
+
+@app.on_event("startup")
+async def startup_db_client():
+    # Start the worker also while starting up
+    asyncio.create_task(poll_sqs())
+
+    if sys.platform == 'win32':
+        try:
+            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+            print("DEBUG: Set WindowsProactorEventLoopPolicy in startup")
+        except Exception as e:
+            print(f"DEBUG: Failed to set event loop policy in startup: {e}")
+
+    try:
+        # The ping command is cheap and does not require auth.
+        await users_collection.database.command("ping")
+
+        print("\n" + "="*50)
+        print("SUCCESS: Connected to MongoDB Cluster successfully!")
+        print("="*50 + "\n")
+    except Exception as e:
+        print("\n" + "!"*50)
+        print(f"ERROR: Failed to connect to MongoDB: {e}")
+        print("!"*50 + "\n")
+
+
+
+app.mount('/artifacts', StaticFiles(directory=settings.output_dir), name='artifacts')
+app.mount('/generated', StaticFiles(directory=HYBRID_PUBLIC_DIR), name='generated')
+service = VideoService()
+client = HeyGenClient()
+styling_service = MediaStylingService(client=client)
+remotion_service = RemotionService()
+s3_service = S3Service()
+sqs_service = SQSService()
+pdf_service = PDFService()
+summarization_service = SummarizationService()
+
+GENERIC_RUNTIME_ERROR = 'Something went wrong while processing your request. Please try again.'
+GENERIC_GENERATION_ERROR = "We couldn't generate the video right now. Please try again in a moment."
+GENERIC_GENERATION_TIMEOUT_ERROR = 'Video generation is taking longer than expected. Please try again shortly.'
+
+
+class LoanOfferInteractionEvent(BaseModel):
+    action: str
+    selected_loan_amount: str | None = None
+    selected_tenure: str | None = None
+    selected_emi: str | None = None
+
+
+def _frontend_public_url(path: str) -> str:
+    base_url = (settings.frontend_url or "").strip().rstrip("/")
+    normalized_path = path if path.startswith("/") else f"/{path}"
+    return f"{base_url}{normalized_path}" if base_url else normalized_path
+
+
+def _interactive_loan_offer_url(video_id: str) -> str:
+    return _frontend_public_url(f"/loan-offer/{video_id}")
+
+
+def _interactive_loan_reminder_url(video_id: str) -> str:
+    return _frontend_public_url(f"/loan-reminder/{video_id}")
+
+
+def _interactive_sales_url(video_id: str) -> str:
+    return _frontend_public_url(f"/sales/{video_id}")
+
+
+def _interactive_remotion_url(video_id: str, template_key: object) -> str | None:
+    if template_key == "loan_offer_interactive":
+        return _interactive_loan_offer_url(video_id)
+    if template_key == "loan_reminder":
+        return _interactive_loan_reminder_url(video_id)
+    if template_key == "scene_loan_offer":
+        return _interactive_sales_url(video_id)
+    return None
+
+
+@app.get("/sample-csvs/bulk-campaign")
+async def download_bulk_campaign_sample_csv():
+    if not SAMPLE_BULK_CSV_PATH.exists():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sample CSV not found")
+
+    return FileResponse(
+        SAMPLE_BULK_CSV_PATH,
+        media_type="text/csv",
+        filename=SAMPLE_BULK_CSV_PATH.name,
+    )
+
+
+def _is_generation_route(path: str) -> bool:
+    return (
+        path.startswith('/generate/')
+        or path.startswith('/jobs/')
+        or (path.startswith('/videos/') and path.endswith('/status'))
+        or (path.startswith('/videos/') and path.endswith('/stylize'))
+    )
+
+
+def _normalize_video_status(status_value: str | None) -> str:
+    normalized = (status_value or "processing").strip().lower()
+    if normalized in {"completed", "done", "success", "styled"}:
+        return "completed"
+    if normalized in {"failed", "error"}:
+        return "failed"
+    return "processing"
+
+
+def _to_mongo_safe(value: object) -> object:
+    if isinstance(value, BaseModel):
+        return {
+            key: _to_mongo_safe(item)
+            for key, item in value.model_dump(mode="python").items()
+        }
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {
+            key: _to_mongo_safe(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple, set)):
+        return [_to_mongo_safe(item) for item in value]
+    return value
+
+
+def _response_video_job_result(result: VideoJobResult) -> VideoJobResult:
+    presigned_video_url = s3_service.presign_s3_url(result.video_url)
+    presigned_interactive_url = s3_service.presign_s3_url(result.interactive_url)
+    if presigned_video_url == result.video_url and presigned_interactive_url == result.interactive_url:
+        return result
+    return result.model_copy(update={
+        'video_url': presigned_video_url,
+        'interactive_url': presigned_interactive_url,
+    })
+
+
+def _response_styled_video_result(result: StyledVideoResult) -> StyledVideoResult:
+    presigned_video_url = s3_service.presign_s3_url(result.final_video_url)
+    if presigned_video_url == result.final_video_url:
+        return result
+    return result.model_copy(update={'final_video_url': presigned_video_url})
+
+
+def _normalize_hybrid_cta_href(value: str | None) -> str:
+    cleaned = str(value or "").strip()
+    if not cleaned:
+        return ""
+    if re.match(r"^[a-z][a-z0-9+.-]*:", cleaned, re.IGNORECASE):
+        return cleaned
+    phone_target = re.sub(r"[^\d+]", "", cleaned)
+    if phone_target and re.fullmatch(r"\+?\d{6,15}", phone_target) and not re.search(r"[./@]", cleaned):
+        return f"tel:{phone_target}"
+    return f"https://{cleaned}"
+
+
+def _normalize_hybrid_cta_buttons(
+    cta_buttons: list[dict[str, str]] | None,
+    *,
+    payment_url: str | None = None,
+    contact_details: str | None = None,
+) -> list[dict[str, str]]:
+    defaults = [
+        {"label": "Pay Now", "value": ""},
+        {"label": "Call Now", "value": ""},
+    ]
+    normalized: list[dict[str, str]] = []
+    for index, fallback in enumerate(defaults):
+        item = cta_buttons[index] if cta_buttons and index < len(cta_buttons) else {}
+        if not isinstance(item, dict):
+            item = {}
+        label = str(item.get("label") or fallback["label"]).strip() or fallback["label"]
+        value = str(item.get("value") or "").strip()
+        normalized.append({"label": label, "value": value})
+
+    if not cta_buttons:
+        payment_value = str(payment_url or "").strip()
+        contact_value = str(contact_details or "").strip()
+        if payment_value:
+            normalized[0]["value"] = payment_value
+        if contact_value:
+            normalized[1]["value"] = contact_value
+
+    return normalized[:2]
+
+
+def _render_hybrid_cta_anchor(index: int, button: dict[str, str]) -> str:
+    label = str(button.get("label") or f"CTA {index + 1}").strip() or f"CTA {index + 1}"
+    href = _normalize_hybrid_cta_href(button.get("value"))
+    escaped_label = html.escape(label)
+    escaped_aria_label = html.escape(label, quote=True)
+    if not href:
+        return (
+            f'<a class="cta cta-{index + 1}" aria-disabled="true" tabindex="-1" '
+            f'aria-label="{escaped_aria_label}">{escaped_label}</a>'
+        )
+
+    target_attr = "" if href.lower().startswith("tel:") else ' target="_blank" rel="noopener noreferrer"'
+    return (
+        f'<a class="cta cta-{index + 1}" href="{html.escape(href, quote=True)}"{target_attr} '
+        f'aria-label="{escaped_aria_label}">{escaped_label}</a>'
+    )
+
+
+def _build_hybrid_avatar_pip_html(
+    *,
+    title: str,
+    video_url: str,
+    brand_name: str,
+    primary_color: str,
+    secondary_color: str,
+    cta_buttons: list[dict[str, str]] | None,
+) -> str:
+    escaped_title = html.escape(title or brand_name or "TVS Credit")
+    normalized_ctas = _normalize_hybrid_cta_buttons(cta_buttons)
+    cta_markup = "\n        ".join(
+        _render_hybrid_cta_anchor(index, button) for index, button in enumerate(normalized_ctas)
+    )
+    payload = json.dumps(
+        {
+            "videoUrl": video_url,
+        },
+        ensure_ascii=True,
+    )
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{escaped_title}</title>
+  <style>
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+      background:
+        radial-gradient(circle at 16% 12%, {secondary_color}55, transparent 32%),
+        radial-gradient(circle at 86% 78%, {primary_color}66, transparent 34%),
+        linear-gradient(180deg, {primary_color} 0%, #063f5f 58%, #021c2f 100%);
+      color: #fff;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }}
+    .shell {{
+      width: min(calc(100vw - 32px), 54vh, 540px);
+    }}
+    .player {{
+      position: relative;
+      width: 100%;
+      aspect-ratio: 9 / 16;
+      overflow: hidden;
+      border-radius: 18px;
+      background: #063f5f;
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      box-shadow: 0 24px 70px rgba(2, 28, 47, 0.34);
+    }}
+    video {{
+      width: 100%;
+      height: 100%;
+      display: block;
+      object-fit: cover;
+      background: #063f5f;
+    }}
+    .cta-overlay {{
+      position: absolute;
+      left: 6%;
+      right: 6%;
+      bottom: 7.8%;
+      z-index: 5;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 3.8%;
+      height: 6.9%;
+      pointer-events: none;
+    }}
+    .cta {{
+      pointer-events: auto;
+      border-radius: 18px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      text-decoration: none;
+      font-size: 1px;
+      font-weight: 400;
+      line-height: 1;
+      color: transparent;
+      background: transparent;
+      box-shadow: none;
+      border: 0;
+      opacity: 0;
+      user-select: none;
+      -webkit-tap-highlight-color: transparent;
+    }}
+    .cta[aria-disabled="true"] {{
+      cursor: default;
+    }}
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <section class="player" aria-label="{escaped_title}">
+      <video id="hybrid-video" controls playsinline preload="metadata"></video>
+      <div class="cta-overlay" aria-label="Repayment actions">
+        {cta_markup}
+      </div>
+    </section>
+  </main>
+  <script>
+    const config = {payload};
+    const video = document.getElementById("hybrid-video");
+    if (config.videoUrl) {{
+      video.src = config.videoUrl;
+    }}
+    document.querySelectorAll('.cta[aria-disabled="true"]').forEach((button) => {{
+      button.addEventListener("click", (event) => event.preventDefault());
+    }});
+  </script>
+</body>
+</html>
+"""
+
+
+def _upload_hybrid_avatar_pip_html(
+    *,
+    video_id: str,
+    title: str,
+    video_url: str,
+    brand_name: str,
+    primary_color: str,
+    secondary_color: str,
+    cta_buttons: list[dict[str, str]] | None,
+) -> str | None:
+    html_dir = settings.output_dir / "interactive" / "hybrid-avatar-pip"
+    html_dir.mkdir(parents=True, exist_ok=True)
+    html_path = html_dir / f"{video_id}.html"
+    html_path.write_text(
+        _build_hybrid_avatar_pip_html(
+            title=title,
+            video_url=video_url,
+            brand_name=brand_name,
+            primary_color=primary_color,
+            secondary_color=secondary_color,
+            cta_buttons=cta_buttons,
+        ),
+        encoding="utf-8",
+    )
+    return s3_service.upload_file(
+        html_path,
+        f"interactive/hybrid-avatar-pip/{video_id}.html",
+        content_type="text/html; charset=utf-8",
+    )
+
+
+def _collection_status_percent(value: str | None) -> int:
+    if value is None or not value.strip():
+        return 75
+
+    match = re.search(r'\d+(?:\.\d+)?', value)
+    if not match:
+        raise ValueError('collection_status must contain a number between 0 and 100')
+
+    parsed = round(float(match.group(0)))
+    if not 0 <= parsed <= 100:
+        raise ValueError('collection_status must be between 0 and 100')
+    return parsed
+
+
+async def _persist_video_job_result(current_user: str, result: VideoJobResult) -> None:
+    update_fields: dict[str, object] = {
+        "status": _normalize_video_status(result.status),
+        "job_data": _to_mongo_safe(result),
+    }
+    if result.title:
+        update_fields["title"] = result.title
+    if result.video_url:
+        update_fields["video_url"] = result.video_url
+
+    await videos_collection.update_one(
+        {
+            "user_id": current_user,
+            "job_data.video_id": result.video_id,
+        },
+        {"$set": update_fields},
+    )
+
+
+async def _mark_video_failed(current_user: str, video_id: str, detail: str) -> None:
+    await videos_collection.update_one(
+        {
+            "user_id": current_user,
+            "job_data.video_id": video_id,
+        },
+        {"$set": {
+            "status": "failed",
+            "job_data": {"detail": detail},
+        }},
+    )
+
+
+def _normalize_avatar_job_status(status_value: str | None) -> Literal['queued', 'processing', 'completed', 'failed']:
+    normalized = (status_value or 'queued').strip().lower()
+    if normalized in {'processing', 'running', 'started'}:
+        return 'processing'
+    if normalized in {'completed', 'done', 'success', 'styled'}:
+        return 'completed'
+    if normalized in {'failed', 'error'}:
+        return 'failed'
+    return 'queued'
+
+
+def _job_progress(job: dict, *, default_phase: str = "Queued", default_progress: int = 5) -> tuple[str, int]:
+    job_data = job.get('job_data') if isinstance(job.get('job_data'), dict) else {}
+    raw_phase = job.get('phase') or job_data.get('phase') or default_phase
+    raw_progress = job.get('progress') if job.get('progress') is not None else job_data.get('progress')
+    try:
+        progress = int(raw_progress)
+    except (TypeError, ValueError):
+        progress = default_progress
+    return str(raw_phase), max(0, min(100, progress))
+
+
+def _build_avatar_job_status_response(job: dict) -> AvatarJobStatusResponse:
+    job_data = job.get('job_data') if isinstance(job.get('job_data'), dict) else {}
+    status_value = _normalize_avatar_job_status(str(job_data.get('status') or job.get('status') or 'queued'))
+    result_payload = job.get('result_payload') if isinstance(job.get('result_payload'), dict) else {}
+    if not result_payload and isinstance(job_data.get('result_payload'), dict):
+        result_payload = job_data.get('result_payload') or {}
+
+    response_payload = result_payload if result_payload else job_data
+    raw_error = job.get('error') or job_data.get('error')
+    cleaned_error = raw_error.strip() if isinstance(raw_error, str) else ''
+    error = cleaned_error or None
+    video_id = str(job.get('_id') or '')
+    phase, progress = _job_progress(
+        job,
+        default_phase="Completed" if status_value == "completed" else "Queued",
+        default_progress=100 if status_value == "completed" else 5,
+    )
+    return AvatarJobStatusResponse(
+        _id=video_id,
+        status=status_value,
+        phase=phase,
+        progress=progress,
+        video_url=s3_service.presign_s3_url(
+            str(response_payload.get('video_url') or job.get('video_url'))
+        ) if (response_payload.get('video_url') or job.get('video_url')) else None,
+        thumbnail_url=str(response_payload.get('thumbnail_url')) if response_payload.get('thumbnail_url') else None,
+        title=str(response_payload.get('title') or job.get('title')) if (response_payload.get('title') or job.get('title')) else None,
+        error=error,
+    )
+
+
+def _mongo_id(value: str) -> ObjectId | str:
+    cleaned = str(value).strip()
+    if ObjectId.is_valid(cleaned):
+        return ObjectId(cleaned)
+    return cleaned
+
+
+def _stored_video_job_id(video: dict[str, Any]) -> str | None:
+    job_data = video.get('job_data') if isinstance(video.get('job_data'), dict) else {}
+    result_payload = video.get('result_payload') if isinstance(video.get('result_payload'), dict) else {}
+
+    for candidate in (
+        job_data.get('video_id'),
+        result_payload.get('video_id'),
+        job_data.get('_id'),
+        result_payload.get('_id'),
+        job_data.get('id'),
+        result_payload.get('id')
+    ):
+        if candidate:
+            return str(candidate)
+    return None
+
+
+def _video_log_snapshot(video: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": str(video.get("_id") or ""),
+        "status": str(video.get("status") or ""),
+        "request_mode": str(video.get("request_mode") or ""),
+        "title": str(video.get("title") or "")[:120],
+        "video_url_type": type(video.get("video_url")).__name__,
+        "created_at_type": type(video.get("created_at")).__name__,
+        "updated_at_type": type(video.get("updated_at")).__name__,
+        "has_job_data": isinstance(video.get("job_data"), dict),
+        "has_result_payload": isinstance(video.get("result_payload"), dict),
+    }
+
+
+async def _find_avatar_video(video_id: str, current_user: str) -> dict[str, Any] | None:
+    return await videos_collection.find_one(
+        {'_id': _mongo_id(video_id), 'user_id': current_user, 'request_mode': 'avatar_async'}
+    )
+
+
+def _build_async_video_status_response(video: dict, request_mode: str) -> VideoJobResult:
+    status_value = str(video.get("status") or "queued")
+    phase, progress = _job_progress(
+        video,
+        default_phase="Completed" if status_value in {"completed", "styled"} else "Queued",
+        default_progress=100 if status_value in {"completed", "styled"} else 5,
+    )
+    job_data = video.get("job_data") if isinstance(video.get("job_data"), dict) else {}
+    raw_response = job_data.get("response") if isinstance(job_data.get("response"), dict) else {}
+    error = video.get("error") or video.get("error_message")
+    if error:
+        raw_response = {**raw_response, "error": str(error)}
+    return VideoJobResult(
+        request_mode=request_mode,
+        _id=str(video.get("_id") or ""),
+        status=status_value,
+        phase=phase,
+        progress=progress,
+        video_url=s3_service.presign_s3_url(video.get("video_url")) if video.get("video_url") else None,
+        thumbnail_url=None,
+        title=str(video.get("title")) if video.get("title") else None,
+        raw_response=raw_response,
+        saved_to=str(video.get("final_video_path")) if video.get("final_video_path") else None,
+        video_path=str(video.get("final_video_path")) if video.get("final_video_path") else None,
+        interactive_url=(
+            s3_service.presign_s3_url(str(video.get("interactive_url"))) if video.get("interactive_url") else None
+        ) or (
+            _interactive_remotion_url(
+                str(video.get("_id") or ""),
+                job_data.get("request_payload", {}).get("template_key") if isinstance(job_data.get("request_payload"), dict) else None,
+            ) if request_mode == "remotion" else None
+        ),
+        error=str(error) if error else None,
+    )
+
+
+async def _refresh_processing_video(video: dict[str, Any], current_user: str) -> None:
+    if video.get("status") != "processing" or video.get("request_mode") not in {"direct", "template"}:
+        return
+
+    external_video_id = _stored_video_job_id(video)
+    if not external_video_id:
+        logger.warning(
+            "Skipping processing video refresh due to missing external provider id | user=%s | snapshot=%s",
+            current_user,
+            json.dumps(_video_log_snapshot(video), default=str),
+        )
+        return
+
+    logger.info(
+        "Refreshing processing video from provider | user=%s | external_video_id=%s | snapshot=%s",
+        current_user,
+        external_video_id,
+        json.dumps(_video_log_snapshot(video), default=str),
+    )
+    try:
+        refreshed = await asyncio.to_thread(
+            service.get_video_status_result,
+            external_video_id,
+            request_mode=str(video.get("request_mode") or "direct"),
+        )
+    except RuntimeError as exc:
+        detail = str(exc)
+        await _mark_video_failed(current_user, external_video_id, detail)
+        video["status"] = "failed"
+        video["job_data"] = {"detail": detail}
+        logger.warning(
+            "Provider refresh marked video as failed | user=%s | external_video_id=%s | error=%s",
+            current_user,
+            external_video_id,
+            detail,
+        )
+        return
+
+    await _persist_video_job_result(current_user, refreshed)
+    video["status"] = _normalize_video_status(refreshed.status)
+    video["title"] = refreshed.title or video.get("title")
+    video["video_url"] = refreshed.video_url or video.get("video_url")
+    video["job_data"] = _to_mongo_safe(refreshed)
+    logger.info(
+        "Provider refresh completed | user=%s | external_video_id=%s | normalized_status=%s | has_video_url=%s",
+        current_user,
+        external_video_id,
+        video["status"],
+        bool(video.get("video_url")),
+    )
+
+
+def _serialize_my_video(video: dict[str, Any]) -> dict[str, Any]:
+    raw_id = video.get("_id")
+    video_id = str(raw_id) if raw_id is not None else ""
+
+    raw_url = video.get("video_url")
+    video_url: str | None
+    if isinstance(raw_url, str) and "/artifacts/" in raw_url:
+        video_url = "/api/artifacts/" + raw_url.split("/artifacts/", 1)[1]
+    elif isinstance(raw_url, str):
+        video_url = s3_service.presign_s3_url(raw_url)
+    else:
+        video_url = None
+
+    created_at = video.get("created_at")
+    updated_at = video.get("updated_at")
+    job_data = video.get("job_data") if isinstance(video.get("job_data"), dict) else {}
+    request_payload = job_data.get("request_payload") if isinstance(job_data.get("request_payload"), dict) else {}
+    template_key = str(request_payload.get("template_key") or "")
+    stored_interactive_url = str(video.get("interactive_url")) if video.get("interactive_url") else None
+    interactive_url = s3_service.presign_s3_url(stored_interactive_url) or _interactive_remotion_url(video_id, template_key)
+
+    return {
+        "_id": video_id,
+        "title": str(video.get("title") or ""),
+        "status": str(video.get("status") or "queued"),
+        "request_mode": str(video.get("request_mode") or ""),
+        "template_key": template_key or None,
+        "video_url": video_url,
+        "interactive_url": interactive_url,
+        "thumbnail_url": str(video.get("thumbnail_url")) if video.get("thumbnail_url") else None,
+        "created_at": created_at.isoformat() if isinstance(created_at, datetime) else created_at,
+        "updated_at": updated_at.isoformat() if isinstance(updated_at, datetime) else updated_at,
+    }
+
+
+def _form_text(value: object) -> str | None:
+    if value is None:
+        return None
+    cleaned = str(value).strip()
+    return cleaned or None
+
+
+def _form_int(value: object) -> int | None:
+    cleaned = _form_text(value)
+    if cleaned is None:
+        return None
+    try:
+        return int(cleaned)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=f'Invalid integer value: {cleaned}') from exc
+
+
+def _form_bool(value: object, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
+LOAN_REMINDER_IMAGE_KEYS = {
+    'logo',
+    'npaWarning',
+    'creditImpact',
+    'lastChance',
+    'ctaScene',
+    'financialBurden',
+}
+
+SALES_TEMPLATE_IMAGE_KEYS = {
+    'scene1',
+    'scene2',
+    'scene3',
+    'scene4',
+    'scene5',
+}
+
+EMI_TEMPLATE_IMAGE_KEYS = {
+    'whatsappPaynow',
+    'smsLink',
+    'clickLink',
+    'upiApps',
+    'openappSearch',
+    'enterlan',
+    'paymentSuccess',
+    'shopVisit',
+}
+
+
+async def _parse_remotion_payload(request: Request) -> RemotionVideoRequest:
+    content_type = request.headers.get('content-type', '').lower()
+
+    if 'application/json' in content_type:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=422, detail='Invalid JSON body for remotion request.')
+        try:
+            return RemotionVideoRequest.model_validate(payload)
+        except ValidationError as exc:
+            raise HTTPException(status_code=422, detail=exc.errors()) from exc
+
+    form = await request.form()
+    logo_file = form.get('logo_file')
+    logo_bytes: bytes | None = None
+    logo_filename: str | None = None
+    loan_reminder_image_paths: dict[str, str] = {}
+    loan_reminder_image_filenames: dict[str, str] = {}
+    loan_reminder_image_bytes: dict[str, bytes] = {}
+    sales_image_paths: dict[str, str] = {}
+    sales_image_filenames: dict[str, str] = {}
+    sales_image_bytes: dict[str, bytes] = {}
+    emi_image_paths: dict[str, str] = {}
+    emi_image_filenames: dict[str, str] = {}
+    emi_image_bytes: dict[str, bytes] = {}
+
+    if isinstance(logo_file, UploadFile) or (
+        logo_file is not None and hasattr(logo_file, 'read') and hasattr(logo_file, 'filename')
+    ):
+        logo_filename = logo_file.filename
+        logo_bytes = await logo_file.read()
+
+    raw_image_paths = _form_text(form.get('loan_reminder_image_paths'))
+    if raw_image_paths:
+        try:
+            parsed_paths = json.loads(raw_image_paths)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=422, detail='Invalid loan_reminder_image_paths JSON.') from exc
+        if not isinstance(parsed_paths, dict):
+            raise HTTPException(status_code=422, detail='loan_reminder_image_paths must be an object.')
+        loan_reminder_image_paths = {
+            str(key): str(value).strip()
+            for key, value in parsed_paths.items()
+            if key in LOAN_REMINDER_IMAGE_KEYS and str(value).strip()
+        }
+
+    for key in LOAN_REMINDER_IMAGE_KEYS:
+        image_file = form.get(f'loan_reminder_image_{key}')
+        if isinstance(image_file, UploadFile) or (
+            image_file is not None and hasattr(image_file, 'read') and hasattr(image_file, 'filename')
+        ):
+            loan_reminder_image_filenames[key] = image_file.filename
+            loan_reminder_image_bytes[key] = await image_file.read()
+
+    raw_sales_paths = _form_text(form.get('sales_image_paths'))
+    if raw_sales_paths:
+        try:
+            parsed_sales_paths = json.loads(raw_sales_paths)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=422, detail='Invalid sales_image_paths JSON.') from exc
+        if not isinstance(parsed_sales_paths, dict):
+            raise HTTPException(status_code=422, detail='sales_image_paths must be an object.')
+        sales_image_paths = {
+            str(key): str(value).strip()
+            for key, value in parsed_sales_paths.items()
+            if key in SALES_TEMPLATE_IMAGE_KEYS and str(value).strip()
+        }
+
+    for key in SALES_TEMPLATE_IMAGE_KEYS:
+        image_file = form.get(f'sales_image_{key}')
+        if isinstance(image_file, UploadFile) or (
+            image_file is not None and hasattr(image_file, 'read') and hasattr(image_file, 'filename')
+        ):
+            sales_image_filenames[key] = image_file.filename
+            sales_image_bytes[key] = await image_file.read()
+
+    raw_emi_paths = _form_text(form.get('emi_image_paths'))
+    if raw_emi_paths:
+        try:
+            parsed_emi_paths = json.loads(raw_emi_paths)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=422, detail='Invalid emi_image_paths JSON.') from exc
+        if not isinstance(parsed_emi_paths, dict):
+            raise HTTPException(status_code=422, detail='emi_image_paths must be an object.')
+        emi_image_paths = {
+            str(key): str(value).strip()
+            for key, value in parsed_emi_paths.items()
+            if key in EMI_TEMPLATE_IMAGE_KEYS and str(value).strip()
+        }
+
+    for key in EMI_TEMPLATE_IMAGE_KEYS:
+        image_file = form.get(f'emi_image_{key}')
+        if isinstance(image_file, UploadFile) or (
+            image_file is not None and hasattr(image_file, 'read') and hasattr(image_file, 'filename')
+        ):
+            emi_image_filenames[key] = image_file.filename
+            emi_image_bytes[key] = await image_file.read()
+
+    logo_opacity = _form_int(form.get('logo_opacity'))
+
+    payload = {
+        'video_variety': _form_text(form.get('video_variety')) or 'personalized',
+        'template_key': _form_text(form.get('template_key')) or 'account_notice',
+        'customer_name': _form_text(form.get('customer_name')),
+        'lan': _form_text(form.get('lan')),
+        'client_name': _form_text(form.get('client_name')),
+        'tos': _form_text(form.get('tos')),
+        'loan_amount': _form_text(form.get('loan_amount')),
+        'payment_url': _form_text(form.get('payment_url')),
+        'days_overdue': _form_int(form.get('days_overdue')),
+        'contact_details': _form_text(form.get('contact_details')),
+        'product_type': _form_text(form.get('product_type')),
+        'language': _form_text(form.get('language')),
+        'script_text': _form_text(form.get('script_text')),
+        'background_color': _form_text(form.get('background_color')),
+        'include_captions': _form_bool(form.get('include_captions')),
+        'title_prefix': _form_text(form.get('title_prefix')) or 'Loan Recall',
+        'video_width': _form_int(form.get('video_width')),
+        'video_height': _form_int(form.get('video_height')),
+        'subtitle_color': _form_text(form.get('subtitle_color')) or 'White',
+        'subtitle_position': _form_text(form.get('subtitle_position')) or 'Bottom',
+        'logo_position': _form_text(form.get('logo_position')) or 'Top Right',
+        'logo_opacity': 80 if logo_opacity is None else logo_opacity,
+        'logo_filename': logo_filename,
+        'logo_bytes': logo_bytes,
+        'loan_reminder_image_paths': loan_reminder_image_paths or None,
+        'loan_reminder_image_filenames': loan_reminder_image_filenames or None,
+        'loan_reminder_image_bytes': loan_reminder_image_bytes or None,
+        'sales_image_paths': sales_image_paths or None,
+        'sales_image_filenames': sales_image_filenames or None,
+        'sales_image_bytes': sales_image_bytes or None,
+        'emi_image_paths': emi_image_paths or None,
+        'emi_image_filenames': emi_image_filenames or None,
+        'emi_image_bytes': emi_image_bytes or None,
+        'voice_gender': _form_text(form.get('voice_gender')) or 'female',
+        'max_loan_amount': _form_text(form.get('max_loan_amount')),
+        'max_tenure': _form_text(form.get('max_tenure')),
+        'max_emi': _form_text(form.get('max_emi')),
+        'loan_id': _form_text(form.get('loan_id')),
+        'month_24_loan_amount': _form_text(form.get('month_24_loan_amount')),
+        'month_30_loan_amount': _form_text(form.get('month_30_loan_amount')),
+        'month_36_loan_amount': _form_text(form.get('month_36_loan_amount')),
+        'month_42_loan_amount': _form_text(form.get('month_42_loan_amount')),
+        'month_48_loan_amount': _form_text(form.get('month_48_loan_amount')),
+        'month_60_loan_amount': _form_text(form.get('month_60_loan_amount')),
+        'emi_calculation24': _form_text(form.get('emi_calculation24')),
+        'emi_calculation30': _form_text(form.get('emi_calculation30')),
+        'emi_calculation36': _form_text(form.get('emi_calculation36')),
+        'emi_calculation42': _form_text(form.get('emi_calculation42')),
+        'emi_calculation48': _form_text(form.get('emi_calculation48')),
+        'emi_calculation60': _form_text(form.get('emi_calculation60')),
+        'cta_phone_number': _form_text(form.get('cta_phone_number')),
+        'interactive_background_color': _form_text(form.get('interactive_background_color')),
+        'interactive_cta_color': _form_text(form.get('interactive_cta_color')),
+        'sales_cta_label': _form_text(form.get('sales_cta_label')),
+        'sales_cta_url': _form_text(form.get('sales_cta_url')),
+    }
+
+    try:
+        logger.info(f"Remotion video payload started: {payload}")
+        return RemotionVideoRequest.model_validate(payload)
+    except ValidationError as exc:
+        safe_errors = exc.errors()
+        for err in safe_errors:
+            if 'input' in err and isinstance(err['input'], bytes):
+                err['input'] = "<raw_bytes_hidden>"
+            if 'logo_bytes' in str(err.get('loc', '')):
+                err['input'] = "<raw_bytes_hidden>"
+            if 'loan_reminder_image_bytes' in str(err.get('loc', '')):
+                err['input'] = "<raw_bytes_hidden>"
+        raise HTTPException(status_code=422, detail=safe_errors) from exc
+
+
+@app.exception_handler(RuntimeError)
+def handle_runtime_error(request: Request, exc: RuntimeError) -> JSONResponse:
+    path = request.url.path
+    print(f'ERROR: RuntimeError at {path}: {exc}')
+    detail = GENERIC_GENERATION_ERROR if _is_generation_route(path) else GENERIC_RUNTIME_ERROR
+    return JSONResponse(status_code=502, content={'detail': detail})
+
+
+@app.exception_handler(TimeoutError)
+def handle_timeout_error(request: Request, exc: TimeoutError) -> JSONResponse:
+    path = request.url.path
+    print(f'ERROR: TimeoutError at {path}: {exc}')
+    detail = GENERIC_GENERATION_TIMEOUT_ERROR if _is_generation_route(path) else GENERIC_RUNTIME_ERROR
+    return JSONResponse(status_code=504, content={'detail': detail})
+
+
+@app.exception_handler(RequestValidationError)
+async def handle_request_validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+    raw_body = await request.body()
+    body_preview = raw_body.decode("utf-8", errors="replace")[:2000] if raw_body else "<empty>"
+    logger.error(
+        "Request validation failed | method=%s | path=%s | query=%s | content_type=%s | body=%s | errors=%s",
+        request.method,
+        request.url.path,
+        request.url.query,
+        request.headers.get("content-type"),
+        body_preview,
+        exc.errors(),
+    )
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+
+
+@app.get('/health')
+def health() -> dict:
+    return {'status': 'ok', 'output_dir': str(settings.output_dir.resolve())}
+
+
+from aiocache import Cache
+
+# Construct the global Cache object
+api_cache = Cache(Cache.MEMORY)
+
+@app.get('/meta/avatars')
+async def list_avatars() -> dict:
+    import time
+    start = time.time()
+
+    cached_data = await api_cache.get("avatars")
+    if cached_data is not None:
+        ms = (time.time() - start) * 1000
+        print(f"\n[AVATAR CACHE HIT] Served directly from Cache Class in {ms:.3f} ms")
+        return cached_data
+
+    print("\n[AVATAR CACHE EMPTY] Fetching data directly from HeyGen API...")
+
+    avatars_resp = client.list_avatars()
+    try:
+        talking_photos_resp = client.list_talking_photos()
+    except Exception:
+        talking_photos_resp = {"data": {"talking_photos": []}}
+
+    # Merge them. extractAvatarArray in frontend looks for root.avatars, data.avatars, etc.
+    # We can just put them both in a list or merge the data arrays.
+
+    avatars_data = avatars_resp.get("data", {}).get("avatars", [])
+    talking_photos_data = talking_photos_resp.get("data", {}).get("talking_photos", [])
+
+    # Standardize talking photos to look more like avatars
+    for tp in talking_photos_data:
+        tp["avatar_id"] = tp.get("talking_photo_id")
+        tp["avatar_name"] = tp.get("talking_photo_name") or "Talking Photo"
+        tp["style"] = "Talking Photo"
+        tp["preview_image_url"] = tp.get("talking_photo_url")
+        # HeyGen talking photos often don't have gender in the root, maybe we can keep it as unknown
+
+    all_avatars = list(avatars_data or []) + list(talking_photos_data or [])
+
+    # Fetch dynamically from MongoDB
+    db_avatars_cursor = custom_avatars_collection.find({})
+    db_avatars_list = await db_avatars_cursor.to_list(length=100)
+
+    db_target_ids = []
+    db_avatars_map = {}
+
+    for db_av in db_avatars_list:
+        aid = db_av.get("avatar_id")
+        if aid:
+            db_target_ids.append(aid)
+            db_avatars_map[aid] = db_av
+
+    updated_avatars = []
+    target_avatars_found = {}
+
+    for a in all_avatars:
+        aid = a.get("avatar_id")
+        name = a.get("avatar_name", "").lower()
+
+        # Standardize gender for Talking Photos or missing genders
+        if not a.get("gender"):
+            if "aditi" in name or "female" in name or "woman" in name:
+                a["gender"] = "female"
+            elif "male" in name or "man" in name:
+                a["gender"] = "male"
+
+        if aid in db_target_ids:
+            # Override HeyGen's raw data with our precise Database Definitions
+            db_def = db_avatars_map[aid]
+            a["avatar_name"] = db_def.get("avatar_name", a.get("avatar_name"))
+            a["preview_image_url"] = db_def.get("preview_image_url", a.get("preview_image_url"))
+            a["gender"] = db_def.get("gender", a.get("gender"))
+            a["is_premium"] = db_def.get("is_premium", False)
+            a["style"] = db_def.get("style", "Lead Avatar")
+            target_avatars_found[aid] = a
+        else:
+            updated_avatars.append(a)
+
+    top_avatars = []
+
+    # Ensure all requested DB avatars are placed at the very top, even if HeyGen API dropped them
+    for aid in db_target_ids:
+        if aid in target_avatars_found:
+            top_avatars.append(target_avatars_found[aid])
+        else:
+            db_def = db_avatars_map[aid]
+            top_avatars.append({
+                "avatar_id": aid,
+                "avatar_name": db_def.get("avatar_name", "Custom Avatar"),
+                "style": db_def.get("style", "Lead Avatar"),
+                "gender": db_def.get("gender", "unknown"),
+                "is_premium": db_def.get("is_premium", False),
+                "preview_image_url": db_def.get("preview_image_url", "")
+            })
+    indian_name_hints = ["aahana", "abhishek", "aditi", "aditya", "ankit", "arjun", "aryan", "diya", "ishita", "kabir", "kavya", "kishore", "maya", "mohan", "rahul", "rohan", "shruti", "sneha", "aakash", "ananya", "neha", "amit", "vikram"]
+    unprofessional_hints = ["outdoor", "sport", "casual", "t-shirt", "tshirt", "t shirt"]
+
+    final_males = []
+    final_females = []
+    seen_base_names = {a.get("avatar_name", "").split()[0].lower() for a in top_avatars if a.get("avatar_name")}
+
+    for a in updated_avatars:
+        name = a.get("avatar_name", "")
+
+        # Remove gender assumptions for strictly matching Indian names since some avatars have blank gender
+        if not a.get("gender"):
+            if "female" in name.lower() or "woman" in name.lower():
+                a["gender"] = "female"
+            elif "male" in name.lower() or "man" in name.lower():
+                a["gender"] = "male"
+            else:
+                n_lower = name.lower()
+                if any(x in n_lower for x in ["aahana", "aditi", "diya", "ishita", "kavya", "maya", "shruti", "sneha", "ananya", "neha"]):
+                    a["gender"] = "female"
+                elif any(x in n_lower for x in ["abhishek", "aditya", "ankit", "arjun", "aryan", "kabir", "karan", "kishore", "mohan", "rahul", "rohan", "sanjay", "aakash", "amit", "vikram"]):
+                    a["gender"] = "male"
+
+        n_lower = name.lower()
+        if any(unprof in n_lower for unprof in unprofessional_hints):
+            continue  # strictly exclude unprofessional/outdoor avatars
+
+        current_gender = a.get("gender", "").lower()
+        base_name = name.split()[0].lower() if name else ""
+
+        if any(ind in n_lower for ind in indian_name_hints) and base_name not in seen_base_names:
+            if current_gender == "male" and len(final_males) < 3:
+                a["style"] = "Professional Male"
+                # Clean up ugly HeyGen nametags
+                a["avatar_name"] = name.replace(" in Brown blazer", "").replace(" in Blue blazer", "").replace(" in Black suit", "")
+                final_males.append(a)
+                seen_base_names.add(base_name)
+
+            elif current_gender == "female" and len(final_females) < 3:
+                # User explicitly requested Kavya Sofa Front, skip all other Kavyas
+                if "kavya" in n_lower and "sofa front" not in n_lower:
+                    continue
+
+                a["style"] = "Professional Female"
+                a["avatar_name"] = name.replace(" Indoor Front", "").replace(" Sofa Front", "").replace(" Office Front", "")
+                final_females.append(a)
+                seen_base_names.add(base_name)
+
+        if len(final_males) == 3 and len(final_females) == 3:
+            break
+
+    # Guarantee EXACTLY 5 total males and exactly 5 total females. Force pad if the catalog falls short natively.
+    m_idx = len(final_males)
+    f_idx = len(final_females)
+    generic_male_names = ["Arjun", "Aditya", "Rohan"]
+    generic_female_names = ["Shruti", "Sneha", "Kavya"]
+
+    for a in updated_avatars:
+        if m_idx == 3 and f_idx == 3:
+            break
+
+        if not a.get("preview_image_url") and not a.get("preview_url"):
+            continue # Ensure we only use avatars with actual loaded thumbnails
+
+        name = a.get("avatar_name", "")
+        base_name = name.split()[0].lower() if name else ""
+        if base_name in seen_base_names:
+            continue
+
+        n_lower = name.lower()
+        if any(unprof in n_lower for unprof in unprofessional_hints):
+            continue
+
+        current_gender = a.get("gender", "").lower()
+        if current_gender == "male" and m_idx < 3:
+            a["style"] = "Professional Male"
+            a["avatar_name"] = generic_male_names[m_idx]
+            final_males.append(a)
+            seen_base_names.add(base_name)
+            m_idx += 1
+        elif current_gender == "female" and f_idx < 3:
+            a["style"] = "Professional Female"
+            a["avatar_name"] = generic_female_names[f_idx]
+            final_females.append(a)
+            seen_base_names.add(base_name)
+            f_idx += 1
+
+    # Guarantee EXACTLY 5 total males and exactly 5 total females. Force pad if the catalog falls short natively using Mediterranean/tan-skin models.
+    m_idx = len(final_males)
+    f_idx = len(final_females)
+    generic_male_names = ["Arjun", "Aditya", "Rohan"]
+    generic_female_names = ["Shruti", "Sneha", "Kavya"]
+
+    brown_passing_male_hints = ["juan", "adrian", "marcos", "lucas", "rafael", "david", "mateo", "daniel"]
+    brown_passing_female_hints = ["adriana", "maria", "elena", "sofia", "isabella", "ana", "carmen", "laura"]
+
+    for a in updated_avatars:
+        if m_idx == 3 and f_idx == 3:
+            break
+
+        if not a.get("preview_image_url") and not a.get("preview_url"):
+            continue # Ensure we only use avatars with actual loaded thumbnails
+
+        name = a.get("avatar_name", "")
+        base_name = name.split()[0].lower() if name else ""
+        if base_name in seen_base_names:
+            continue
+
+        n_lower = name.lower()
+        if any(unprof in n_lower for unprof in unprofessional_hints):
+            continue
+
+        current_gender = a.get("gender", "").lower()
+
+        # Only inject avatars that physically appear tan or Mediterranean to act as Indian stand-ins
+        is_brown_male = any(h in n_lower for h in brown_passing_male_hints)
+        is_brown_female = any(h in n_lower for h in brown_passing_female_hints)
+
+        if current_gender == "male" and m_idx < 3 and is_brown_male:
+            a["style"] = "Professional Male"
+            a["avatar_name"] = generic_male_names[m_idx]
+            final_males.append(a)
+            seen_base_names.add(base_name)
+            m_idx += 1
+        elif current_gender == "female" and f_idx < 3 and is_brown_female:
+            a["style"] = "Professional Female"
+            a["avatar_name"] = generic_female_names[f_idx]
+            final_females.append(a)
+            seen_base_names.add(base_name)
+            f_idx += 1
+
+    # Combine lists: top_avatars first
+    final_list = top_avatars + final_males + final_females
+
+    result = {
+        "data": {
+            "avatars": final_list
+        }
+    }
+
+    await api_cache.set("avatars", result, ttl=7200)
+    ms = (time.time() - start) * 1000
+    print(f"[AVATAR CACHE SAVED] Fetched from HeyGen and wrote to aiocache in {ms:.3f} ms")
+
+    return result
+
+
+@app.get('/meta/voices')
+async def list_voices() -> dict:
+    import time
+    start = time.time()
+
+    cached_data = await api_cache.get("voices")
+    if cached_data is not None:
+        ms = (time.time() - start) * 1000
+        print(f"\n[VOICE CACHE HIT] Served directly from Cache Class in {ms:.3f} ms")
+        return cached_data
+
+    print("\n[VOICE CACHE EMPTY] Fetching data directly from HeyGen API...")
+
+    raw_result = client.list_voices()
+    voices = raw_result.get("data", {}).get("voices", [])
+
+    # Filter out explicitly removed voices (generic Aditi) but keep Adv. Aditi Mehra.
+    # Then de-duplicate near-identical name variants so users see only one useful entry.
+    filtered_voices = []
+    seen_adv_aditi = False
+    for v in voices:
+        v_name = v.get("name", "").lower()
+        # Exclude if it's the generic Aditi (starts with aditi) and not the custom advocate voice
+        if "aditi" in v_name or "mehra" in v_name:
+            if "adv" in v_name or "mehra" in v_name:
+                if seen_adv_aditi:
+                    continue
+                seen_adv_aditi = True
+            else:
+                continue
+
+        filtered_voices.append(v)
+
+    def _voice_name_key(voice: dict) -> str:
+        raw_name = str(voice.get("name") or voice.get("voice_name") or "").lower()
+        normalized = "".join(char if (char.isalnum() or char.isspace()) else " " for char in raw_name)
+        return " ".join(normalized.split())
+
+    def _has_preview_audio(voice: dict) -> bool:
+        return bool(
+            voice.get("preview_audio")
+            or voice.get("preview_audio_url")
+            or voice.get("preview_url")
+            or voice.get("audio_preview_url")
+        )
+
+    deduped_voices: list[dict] = []
+    name_to_index: dict[str, int] = {}
+    for voice in filtered_voices:
+        key = _voice_name_key(voice)
+        if not key:
+            deduped_voices.append(voice)
+            continue
+
+        existing_index = name_to_index.get(key)
+        if existing_index is None:
+            name_to_index[key] = len(deduped_voices)
+            deduped_voices.append(voice)
+            continue
+
+        existing_voice = deduped_voices[existing_index]
+        if _has_preview_audio(voice) and not _has_preview_audio(existing_voice):
+            deduped_voices[existing_index] = voice
+
+    if "data" in raw_result and "voices" in raw_result["data"]:
+        raw_result["data"]["voices"] = deduped_voices
+
+    await api_cache.set("voices", raw_result, ttl=7200)
+    ms = (time.time() - start) * 1000
+    print(f"[VOICE CACHE SAVED] Fetched from HeyGen and wrote to aiocache in {ms:.3f} ms")
+
+    return raw_result
+
+
+@app.post("/pdf/upload")
+async def upload_pdf(
+    file: UploadFile = File(...),
+    current_user: str = Depends(get_current_user)
+):
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are allowed")
+    try:
+        content = await file.read()
+        file_path = pdf_service.save_upload(content, file.filename)
+        extracted_text = pdf_service.extract_text(file_path)
+        
+        # Upload original PDF to S3 for sharing
+        s3_url = None
+        if settings.aws_access_key_id:
+            try:
+                # Generate a unique S3 key per upload to avoid cross-user filename collisions.
+                safe_filename = Path(file.filename).name
+                unique_token = f"{now_ist().strftime('%Y%m%d%H%M%S')}_{uuid4().hex[:8]}"
+                s3_key = f"notices/{unique_token}_{safe_filename}"
+                s3_url = s3_service.upload_file(file_path, s3_key, content_type="application/pdf")
+            except Exception as e:
+                logger.error(f"Failed to upload original PDF to S3: {e}")
+
+        pdf_record = PDFRecord(
+            user_id=current_user,
+            filename=file.filename,
+            pdf_url=s3_url,
+            original_text=extracted_text,
+            status="pending"
+        )
+        from app.database import pdf_collection
+        result = await pdf_collection.insert_one(pdf_record.model_dump())
+        return {"pdf_id": str(result.inserted_id), "status": "pending"}
+    except Exception as e:
+        logger.error(f"PDF Upload Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/pdf/{pdf_id}/summarize")
+async def summarize_pdf(
+    pdf_id: str,
+    language: str = "Hindi",
+    gender: str = Query("Female", description="Gender for voice: 'Male' or 'Female'"),
+    current_user: str = Depends(get_current_user)
+):
+    from app.database import pdf_collection
+    pdf = await pdf_collection.find_one({"_id": ObjectId(pdf_id), "user_id": current_user})
+    if not pdf:
+        raise HTTPException(status_code=404, detail="PDF not found")
+    if not pdf.get("original_text"):
+        raise HTTPException(status_code=400, detail="No text found in PDF to summarize")
+    await pdf_collection.update_one(
+        {"_id": ObjectId(pdf_id)},
+        {"$set": {"status": "summarizing", "updated_at": now_ist()}}
+    )
+    try:
+        summary = await summarization_service.summarize_text(pdf["original_text"], target_language=language, gender=gender)
+
+        update_doc = {
+            "summary_text": summary,
+            "next_actions_text": "",
+            "status": "completed",
+            "updated_at": now_ist(),
+        }
+
+        await pdf_collection.update_one(
+            {"_id": ObjectId(pdf_id)},
+            {"$set": update_doc}
+        )
+        return {"status": "completed", "summary": summary, "next_actions": ""}
+    except Exception as e:
+        await pdf_collection.update_one(
+            {"_id": ObjectId(pdf_id)},
+            {"$set": {"status": "failed", "updated_at": now_ist()}}
+        )
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/pdf/{pdf_id}/status")
+async def get_pdf_status(
+    pdf_id: str,
+    current_user: str = Depends(get_current_user)
+):
+    from app.database import pdf_collection
+    pdf = await pdf_collection.find_one({"_id": ObjectId(pdf_id), "user_id": current_user})
+    if not pdf:
+        raise HTTPException(status_code=404, detail="PDF not found")
+    return {
+        "status": pdf["status"],
+        "summary": pdf.get("summary_text"),
+        "next_actions": pdf.get("next_actions_text"),
+        "filename": pdf["filename"],
+        "audio_url": pdf.get("audio_url"),
+        "next_actions_audio_url": pdf.get("next_actions_audio_url")
+    }
+
+@app.post("/pdf/{pdf_id}/generate-audio")
+async def generate_pdf_audio(
+    pdf_id: str,
+    data: dict | None = Body(default=None),
+    language: str = "Hindi",
+    gender: str = "Female",
+    kind: str = Query("summary", description="Type of audio to generate: 'summary' or 'next_actions'"),
+    current_user: str = Depends(get_current_user)
+):
+    # Retrieve text from body (for live edits) or fallback to DB
+    edited_text = (data or {}).get("text")
+    logger.info(
+        "PDF audio request received | pdf_id=%s | kind=%s | language=%s | gender=%s | has_body=%s | has_edited_text=%s",
+        pdf_id,
+        kind,
+        language,
+        gender,
+        data is not None,
+        bool(edited_text),
+    )
+    from app.database import pdf_collection
+    pdf = await pdf_collection.find_one({"_id": ObjectId(pdf_id), "user_id": current_user})
+    if not pdf:
+        logger.warning("PDF audio request failed | pdf_id=%s | reason=pdf_not_found", pdf_id)
+        raise HTTPException(status_code=404, detail="PDF not found")
+    # Determine which text to convert to audio
+    kind = (kind or "summary").lower()
+    if kind == "summary":
+        text_key = "summary_text"
+        prefix = "summary"
+    elif kind in ("next_actions", "next-actions", "nextactions"):
+        text_key = "next_actions_text"
+        prefix = "next_actions"
+    else:
+        raise HTTPException(status_code=400, detail="Invalid kind parameter")
+
+    # Use live edited text if provided, otherwise fetch from DB
+    text_to_convert = edited_text
+    if not text_to_convert:
+        if not pdf.get(text_key):
+            logger.warning(
+                "PDF audio request failed | pdf_id=%s | kind=%s | reason=missing_text | text_key=%s",
+                pdf_id,
+                kind,
+                text_key,
+            )
+            if kind in ("next_actions", "next-actions", "nextactions"):
+                await pdf_collection.update_one(
+                    {"_id": ObjectId(pdf_id)},
+                    {"$set": {text_key: "", "next_actions_audio_url": None, "updated_at": now_ist()}}
+                )
+                return {"status": "skipped", "audio_url": None}
+            raise HTTPException(status_code=400, detail=f"{text_key} not available. Summarize the document first.")
+        text_to_convert = pdf[text_key]
+
+    if kind in ("next_actions", "next-actions", "nextactions") and not str(text_to_convert).strip():
+        await pdf_collection.update_one(
+            {"_id": ObjectId(pdf_id)},
+            {"$set": {text_key: "", "next_actions_audio_url": None, "updated_at": now_ist()}}
+        )
+        return {"status": "skipped", "audio_url": None}
+
+    try:
+        logger.info(
+            "PDF audio generation starting | pdf_id=%s | kind=%s | prefix=%s | text_length=%s",
+            pdf_id,
+            kind,
+            prefix,
+            len(text_to_convert),
+        )
+        audio_url = await audio_service.generate_audio(
+            pdf_id=pdf_id,
+            text=text_to_convert,
+            language=language,
+            gender=gender,
+            prefix=prefix
+        )
+        
+        # Sync the edited text back to the database so it's saved
+        if edited_text:
+            await pdf_collection.update_one(
+                {"_id": ObjectId(pdf_id)},
+                {"$set": {text_key: edited_text, "updated_at": now_ist()}}
+            )
+
+        logger.info(
+            "PDF audio generation completed | pdf_id=%s | kind=%s | audio_url=%s",
+            pdf_id,
+            kind,
+            audio_url,
+        )
+        return {"status": "completed", "audio_url": audio_url}
+    except Exception as e:
+        logger.exception("Audio Generation Error | pdf_id=%s | kind=%s", pdf_id, kind)
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Static serving for PDF audio fallback
+@app.get("/pdf/audio/{filename}")
+async def get_pdf_audio_file(filename: str):
+    file_path = Path(settings.default_output_dir) / "pdf_audio" / filename
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Audio file not found")
+    from fastapi.responses import FileResponse
+    return FileResponse(file_path)
+
+@app.post("/pdf/{pdf_id}/whatsapp-log")
+async def log_pdf_whatsapp(
+    pdf_id: str,
+    current_user: str = Depends(get_current_user)
+):
+    from app.database import pdf_collection, whatsapp_logs_collection
+    pdf = await pdf_collection.find_one({"_id": ObjectId(pdf_id), "user_id": current_user})
+    
+    if not pdf:
+        raise HTTPException(status_code=404, detail="PDF not found")
+
+    log_entry = {
+        "pdf_id": pdf_id,
+        "user_id": current_user,
+        "filename": pdf["filename"],
+        "action": "whatsapp_summary_generated",
+        "timestamp": now_ist()
+    }
+    
+    await whatsapp_logs_collection.insert_one(log_entry)
+    return {"status": "logged"}
+
+@app.get("/pdf/share/{pdf_id}")
+async def share_pdf_summary(pdf_id: str):
+    from app.database import pdf_collection
+    if not ObjectId.is_valid(pdf_id):
+        raise HTTPException(status_code=400, detail="Invalid PDF ID")
+    
+    pdf = await pdf_collection.find_one({"_id": ObjectId(pdf_id)})
+    if not pdf:
+        raise HTTPException(status_code=404, detail="Summary not found")
+        
+    # Presign all relevant URLs
+    audio_url = pdf.get("audio_url")
+    if audio_url:
+        audio_url = s3_service.presign_s3_url(audio_url)
+        
+    next_actions_audio_url = pdf.get("next_actions_audio_url")
+    if next_actions_audio_url:
+        next_actions_audio_url = s3_service.presign_s3_url(next_actions_audio_url)
+
+    pdf_url = pdf.get("pdf_url")
+    if not pdf_url:
+        # Fallback: Try to upload local file to S3 if missing (for older records)
+        filename = pdf.get("filename")
+        if filename:
+            local_path = Path("input/pdf") / filename
+            if local_path.exists():
+                logger.info(f"Auto-uploading missing S3 PDF for share link: {filename}")
+                safe_filename = Path(filename).name
+                s3_key = f"notices/{pdf_id}_{safe_filename}"
+                pdf_url = s3_service.upload_file(local_path, s3_key, content_type="application/pdf")
+                if pdf_url:
+                    # Save it so we don't have to upload again next time
+                    await pdf_collection.update_one({"_id": ObjectId(pdf_id)}, {"$set": {"pdf_url": pdf_url}})
+    
+    if pdf_url:
+        pdf_url = s3_service.presign_s3_url(pdf_url)
+        
+    return {
+        "summary_text": pdf.get("summary_text"),
+        "next_actions_text": pdf.get("next_actions_text"),
+        "audio_url": audio_url,
+        "next_actions_audio_url": next_actions_audio_url,
+        "pdf_url": pdf_url,
+        "filename": pdf.get("filename"),
+        "language": pdf.get("language"),
+        "created_at": pdf.get("created_at")
+    }
+
+@app.get('/meta/config')
+def get_config() -> dict:
+    return {
+        "default_avatar_id": settings.heygen_avatar_id,
+        "default_voice_id": settings.heygen_voice_id,
+        "default_template_id": settings.heygen_template_id,
+        "frontend_url": settings.frontend_url,
+        "default_language": "Hindi"
+    }
+
+
+
+
+
+@app.get('/proxy-audio')
+async def proxy_audio(url: str):
+    import httpx
+    from fastapi.responses import StreamingResponse
+    print(f"DEBUG: Proxying audio from {url}")
+
+    async def stream_audio():
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+            "Accept": "audio/webm,audio/ogg,audio/wav,audio/*;q=0.9,application/ogg;q=0.7,video/*;q=0.6,*/*;q=0.5"
+        }
+        async with httpx.AsyncClient(follow_redirects=True, headers=headers) as client:
+            try:
+                async with client.stream('GET', url) as response:
+                    async for chunk in response.aiter_bytes():
+                        yield chunk
+            except Exception:
+                pass
+
+    return StreamingResponse(stream_audio(), media_type="audio/mpeg")
+
+
+@app.get('/meta/templates')
+def list_templates(current_user: str = Depends(get_current_user)) -> dict:
+    return client.list_templates()
+
+
+@app.get('/meta/template/{template_id}')
+def get_template_details(template_id: str, version: str = 'v3', current_user: str = Depends(get_current_user)) -> dict:
+    return client.get_template_details(template_id, version=version)
+
+
+# â”€â”€ WhatsApp Campaign Templates (DB-backed) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+@app.get('/meta/whatsapp-templates')
+async def list_whatsapp_templates(current_user: str = Depends(get_current_user)):
+    """Return all WhatsApp campaign templates stored in MongoDB."""
+    cursor = whatsapp_templates_collection.find({}, {"_id": 0})
+    templates = await cursor.to_list(length=200)
+    return templates
+
+
+@app.post('/admin/whatsapp-templates')
+async def create_whatsapp_template(payload: dict, admin_user: dict = Depends(get_current_admin)):
+    """Admin-only: insert a new WhatsApp campaign template."""
+    required = {"id", "name", "whatsapp"}
+    missing = required - payload.keys()
+    if missing:
+        raise HTTPException(status_code=422, detail=f"Missing required fields: {missing}")
+    existing = await whatsapp_templates_collection.find_one({"id": payload["id"]})
+    if existing:
+        raise HTTPException(status_code=409, detail=f"Template with id '{payload['id']}' already exists.")
+    await whatsapp_templates_collection.insert_one(payload)
+    return {"status": "created", "id": payload["id"]}
+
+
+@app.put('/admin/whatsapp-templates/{template_id}')
+async def update_whatsapp_template(template_id: str, payload: dict, admin_user: dict = Depends(get_current_admin)):
+    """Admin-only: update an existing WhatsApp campaign template."""
+    result = await whatsapp_templates_collection.update_one({"id": template_id}, {"$set": payload})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail=f"Template '{template_id}' not found.")
+    return {"status": "updated", "id": template_id}
+
+
+@app.delete('/admin/whatsapp-templates/{template_id}')
+async def delete_whatsapp_template(template_id: str, admin_user: dict = Depends(get_current_admin)):
+    """Admin-only: delete a WhatsApp campaign template."""
+    result = await whatsapp_templates_collection.delete_one({"id": template_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail=f"Template '{template_id}' not found.")
+    return {"status": "deleted", "id": template_id}
+
+
+async def _proxy_cpaas_request(method: str, path: str, payload: Any | None = None) -> JSONResponse:
+    if not settings.cpaas_api_auth_token:
+        raise HTTPException(status_code=500, detail="CPAAS_API_AUTH_TOKEN is not configured.")
+
+    import httpx
+
+    payload_summary = payload
+    if isinstance(payload, dict):
+        payload_summary = dict(payload)
+        leads = payload_summary.get("leads")
+        if isinstance(leads, list):
+            payload_summary["leadCount"] = len(leads)
+            payload_summary["firstLead"] = leads[0] if leads else None
+            payload_summary.pop("leads", None)
+
+    url = f"{settings.cpaas_api_root_url.rstrip('/')}/{path.lstrip('/')}"
+    headers = {
+        "Accept": "application/json",
+        "API-AUTH-TOKEN": settings.cpaas_api_auth_token,
+    }
+
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+
+    logger.info(
+        "CPAAS request | method=%s | url=%s | path=%s | payload=%s",
+        method,
+        url,
+        path,
+        json.dumps(payload_summary, default=str),
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.request(method, url, headers=headers, json=payload)
+    except httpx.HTTPError as exc:
+        logger.exception("CPAAS transport failure | method=%s | url=%s | path=%s", method, url, path)
+        raise HTTPException(status_code=502, detail=f"Failed to reach CPAAS service: {exc}") from exc
+
+    content_type = response.headers.get("content-type", "")
+    response_text = response.text
+    if "application/json" in content_type.lower():
+        try:
+            body: Any = response.json()
+        except ValueError:
+            body = {
+                "success": response.is_success,
+                "status": response.status_code,
+                "message": response_text,
+            }
+    else:
+        body = {
+            "success": response.is_success,
+            "status": response.status_code,
+            "message": response_text,
+        }
+
+    logger.info(
+        "CPAAS response | method=%s | url=%s | path=%s | status=%s | body=%s",
+        method,
+        url,
+        path,
+        response.status_code,
+        json.dumps(body, default=str)[:4000],
+    )
+
+    return JSONResponse(status_code=response.status_code, content=body)
+
+
+async def _resolve_cpaas_template_key(template_id: Any) -> str | None:
+    raw_template_id = str(template_id or "").strip()
+    if not raw_template_id:
+        return None
+
+    template_doc = await whatsapp_templates_collection.find_one(
+        {
+            "$or": [
+                {"id": raw_template_id},
+                {"name": raw_template_id},
+                {"templateId": raw_template_id},
+                {"template_id": raw_template_id},
+                {"vendorTemplateId": raw_template_id},
+                {"vendor_template_id": raw_template_id},
+            ]
+        }
+    )
+
+    if not template_doc:
+        logger.warning(
+            "CPAAS template resolution fell back to raw template id | requested=%s",
+            raw_template_id,
+        )
+        return raw_template_id
+
+    resolved_template_key = str(
+        template_doc.get("id")
+        or template_doc.get("name")
+        or template_doc.get("templateId")
+        or template_doc.get("template_id")
+        or template_doc.get("vendorTemplateId")
+        or template_doc.get("vendor_template_id")
+        or raw_template_id
+    ).strip()
+
+    logger.info(
+        "CPAAS template resolution | requested=%s | resolved=%s | doc_id=%s | doc_name=%s | vendor_template_id=%s",
+        raw_template_id,
+        resolved_template_key,
+        template_doc.get("id"),
+        template_doc.get("name"),
+        template_doc.get("templateId")
+        or template_doc.get("template_id")
+        or template_doc.get("vendorTemplateId")
+        or template_doc.get("vendor_template_id"),
+    )
+
+    return resolved_template_key or raw_template_id
+
+
+def _normalize_cpaas_lead_variables(payload: dict[str, Any]) -> dict[str, Any]:
+    upstream_payload = dict(payload)
+    raw_leads = upstream_payload.get("leads")
+    if not isinstance(raw_leads, list):
+        return upstream_payload
+
+    normalized_leads: list[dict[str, Any]] = []
+    for lead in raw_leads:
+        if not isinstance(lead, dict):
+            normalized_leads.append(lead)
+            continue
+
+        normalized_lead = dict(lead)
+        raw_variables = normalized_lead.get("variables")
+        if isinstance(raw_variables, list):
+            variables_map: dict[str, str] = {}
+            for item in raw_variables:
+                if not isinstance(item, dict):
+                    continue
+                key = str(item.get("key") or item.get("name") or "").strip()
+                if not key:
+                    continue
+                value = item.get("val")
+                if value is None:
+                    value = item.get("value")
+                variables_map[key] = "" if value is None else str(value)
+
+            logger.info(
+                "Normalized CPaaS lead variables from array to object | uniqueId=%s | keys=%s",
+                normalized_lead.get("uniqueId"),
+                sorted(variables_map.keys()),
+            )
+            normalized_lead["variables"] = variables_map
+
+        normalized_leads.append(normalized_lead)
+
+    upstream_payload["leads"] = normalized_leads
+    return upstream_payload
+
+
+@app.post('/cpaas/campaigns')
+async def create_cpaas_campaign(payload: dict, current_user: str = Depends(get_current_user)):
+    upstream_payload = dict(payload)
+    if not upstream_payload.get("communicationType") and upstream_payload.get("campaignType"):
+        upstream_payload["communicationType"] = upstream_payload["campaignType"]
+    resolved_template_key = await _resolve_cpaas_template_key(upstream_payload.get("templateId"))
+    if resolved_template_key:
+        upstream_payload["templateId"] = resolved_template_key
+    return await _proxy_cpaas_request("POST", "/campaigns", upstream_payload)
+
+
+@app.post('/cpaas/campaigns/push-lead')
+async def push_cpaas_campaign_leads(payload: dict, current_user: str = Depends(get_current_user)):
+    upstream_payload = _normalize_cpaas_lead_variables(payload)
+    return await _proxy_cpaas_request("POST", "/campaigns/push-lead", upstream_payload)
+
+
+@app.post('/cpaas/campaigns/{campaign_code}/status')
+async def update_cpaas_campaign_status(
+    campaign_code: str,
+    status: str = Query(...),
+    current_user: str = Depends(get_current_user),
+):
+    return await _proxy_cpaas_request("POST", f"/campaigns/{campaign_code}/status?status={status}")
+
+
+# --- Authentication Endpoints ---
+
+@app.post("/auth/signup", response_model=dict)
+async def signup(user: UserCreate):
+    normalized_email = str(user.email).strip().lower()
+    display_name = (user.full_name or normalized_email.split("@", 1)[0]).strip()
+
+    print(f"DEBUG: Signup request received for user: {normalized_email}")
+    existing_user = await users_collection.find_one({"email": normalized_email})
+    if existing_user:
+        print(f"DEBUG: User {normalized_email} already exists")
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    hashed_password = get_password_hash(user.password)
+    user_dict = user.model_dump()
+    user_dict["email"] = normalized_email
+    user_dict["full_name"] = user.full_name.strip() if user.full_name else None
+    user_dict["username"] = display_name
+    user_dict["hashed_password"] = hashed_password
+    del user_dict["password"]
+
+    await users_collection.insert_one(user_dict)
+    print(f"DEBUG: User {normalized_email} successfully registered")
+    return {"message": "User created successfully"}
+
+@app.post("/auth/login", response_model=Token)
+async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    login_identifier = form_data.username.strip()
+    normalized_identifier = login_identifier.lower()
+
+    print(f"DEBUG: Login request received for account: {login_identifier}")
+    user = await users_collection.find_one(
+        {
+            "$or": [
+                {"email": normalized_identifier},
+                {"email": login_identifier},
+                {"username": login_identifier},
+            ]
+        }
+    )
+    if not user or not verify_password(form_data.password, user["hashed_password"]):
+        print(f"DEBUG: Login failed for account: {login_identifier}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    print(f"DEBUG: Login successful for account: {login_identifier}")
+    access_token = create_access_token(data={"sub": str(user["_id"]), "email": user["email"]})
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "email": user["email"],
+        "full_name": user.get("full_name"),
+        "is_admin": user.get("is_admin", False),
+    }
+
+
+# --- Video Generation Endpoints ---
+
+@app.post('/jobs/avatar', response_model=AvatarJobAck)
+async def create_avatar_job(request: DirectVideoRequest, current_user: str = Depends(get_current_user)):
+    queue_url = SQS_QUEUE_URL
+
+    video_id: str | None = None
+    try:
+        now = now_ist()
+        request_payload = _to_mongo_safe(request.model_dump(mode='python'))
+        video_record = VideoRecord(
+            user_id=current_user,
+            status='queued',
+            title=f"{request.title_prefix} - {request.customer_name}",
+            request_mode='avatar_async',
+            job_data={
+                'request_mode': 'avatar',
+                'status': 'queued',
+                'phase': 'Queued',
+                'progress': 5,
+                'attempts': 0,
+                'request_payload': request_payload,
+            },
+        )
+        video_doc = _to_mongo_safe(video_record)
+        if isinstance(video_doc, dict):
+            video_doc.update({
+                'request_payload': request_payload,
+                'result_payload': None,
+                'error': None,
+                'phase': 'Queued',
+                'progress': 5,
+                'attempts': 0,
+                'updated_at': now,
+                'started_at': None,
+                'completed_at': None,
+            })
+        insert_result = await videos_collection.insert_one(video_doc)
+        video_id = str(insert_result.inserted_id)
+        sqs_service.send_job(
+            payload={'_id': video_id, 'request_mode': 'avatar'},
+            queue_url=queue_url,
+        )
+        return AvatarJobAck(_id=video_id, status='queued')
+    except HTTPException:
+        raise
+    except Exception as exc:
+        if not video_id:
+            raise HTTPException(status_code=502, detail=GENERIC_GENERATION_ERROR) from exc
+        failed_at = now_ist()
+        await videos_collection.update_one(
+            {'_id': _mongo_id(video_id), 'user_id': current_user},
+            {'$set': {
+                'status': 'failed',
+                'error': str(exc),
+                'updated_at': failed_at,
+                'completed_at': failed_at,
+                'job_data': {
+                    'request_mode': 'avatar',
+                    'status': 'failed',
+                    'error': str(exc),
+                },
+            }},
+        )
+        raise HTTPException(status_code=502, detail=GENERIC_GENERATION_ERROR) from exc
+
+
+@app.get('/jobs/{video_id}', response_model=AvatarJobStatusResponse)
+async def get_avatar_job_status(video_id: str, current_user: str = Depends(get_current_user)):
+    video = await _find_avatar_video(video_id, current_user)
+    if not video:
+        raise HTTPException(status_code=404, detail='Job not found.')
+    return _build_avatar_job_status_response(video)
+
+@app.post('/generate/direct')
+async def generate_direct(request: DirectVideoRequest, wait: bool = True, current_user: str = Depends(get_current_user)):
+    result = service.generate_direct(request, wait=wait)
+
+    if wait and result.saved_to:
+        s3_url = s3_service.upload_video(result.saved_to, f"videos/{result.video_id}.mp4")
+        if s3_url:
+            result.video_url = s3_url
+
+    # Save to MongoDB
+    video_record = VideoRecord(
+        user_id=current_user,
+        status="completed" if wait else "processing",
+        title=f"{request.title_prefix} - {request.customer_name}",
+        request_mode="direct",
+        job_data=_to_mongo_safe(result)
+    )
+    await videos_collection.insert_one(_to_mongo_safe(video_record))
+    
+    return _response_video_job_result(result)
+
+
+@app.post('/generate/hybrid-remotion-avatar-pip', response_model=VideoJobResult)
+async def generate_hybrid_remotion_avatar_pip(
+    request: HybridRemotionAvatarPipRequest,
+    current_user: str = Depends(get_current_user),
+):
+    if not request.avatar_id.strip():
+        raise HTTPException(status_code=400, detail="avatar_id is required")
+    if not request.voice_id.strip():
+        raise HTTPException(status_code=400, detail="voice_id is required")
+
+    try:
+        collection_status = _collection_status_percent(request.collection_status)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    video_id = uuid4().hex
+    request_payload = _to_mongo_safe(request)
+    if isinstance(request_payload, dict):
+        normalized_gender = str(request_payload.get("voice_gender") or "").strip().lower()
+        normalized_agent = str(request_payload.get("agent_name") or "").strip().lower()
+        if normalized_gender == "male" and normalized_agent in {"", "priya"}:
+            request_payload["agent_name"] = "Amit"
+        elif normalized_gender == "female" and normalized_agent in {"", "amit"}:
+            request_payload["agent_name"] = "Priya"
+    video_record = VideoRecord(
+        user_id=current_user,
+        status="queued",
+        title=f"TVS Credit - {request.customer_name}",
+        video_url=None,
+        request_mode="hybrid_remotion_avatar_pip",
+        job_data={
+            "request_mode": "hybrid_remotion_avatar_pip",
+            "status": "queued",
+            "phase": "Queued",
+            "progress": 5,
+            "collection_status_percent": collection_status,
+            "request_payload": request_payload,
+        },
+    )
+    video_doc = _to_mongo_safe(video_record)
+    if isinstance(video_doc, dict):
+        video_doc.update({
+            "_id": video_id,
+            "phase": "Queued",
+            "progress": 5,
+            "updated_at": now_ist(),
+            "error": None,
+        })
+    await videos_collection.insert_one(video_doc)
+    asyncio.create_task(_process_hybrid_remotion_avatar_pip_job(video_id))
+    return _response_video_job_result(VideoJobResult(
+        request_mode="hybrid_remotion_avatar_pip",
+        _id=video_id,
+        status="queued",
+        phase="Queued",
+        progress=5,
+        video_url=None,
+        thumbnail_url=None,
+        title=f"TVS Credit - {request.customer_name}",
+        raw_response={},
+        saved_to=None,
+    ))
+
+
+async def _process_hybrid_remotion_avatar_pip_job(video_id: str) -> None:
+    async def set_progress(status_value: str, phase: str, progress: int, extra: dict[str, Any] | None = None) -> None:
+        fields = {
+            "status": status_value,
+            "phase": phase,
+            "progress": max(0, min(100, int(progress))),
+            "updated_at": now_ist(),
+            "job_data.status": status_value,
+            "job_data.phase": phase,
+            "job_data.progress": max(0, min(100, int(progress))),
+        }
+        if extra:
+            fields.update(extra)
+        await videos_collection.update_one({"_id": video_id}, {"$set": fields})
+
+    job = await videos_collection.find_one({"_id": video_id})
+    if not job:
+        logger.warning("Hybrid job %s not found.", video_id)
+        return
+
+    job_data = job.get("job_data") if isinstance(job.get("job_data"), dict) else {}
+    request_payload = job_data.get("request_payload") if isinstance(job_data.get("request_payload"), dict) else {}
+
+    try:
+        request = HybridRemotionAvatarPipRequest.model_validate(request_payload)
+        collection_status = int(job_data.get("collection_status_percent") or _collection_status_percent(request.collection_status))
+        await set_progress("processing", "Generating avatar speech", 20)
+        raw_avatar = await asyncio.to_thread(
+            generate_raw_avatar_for_hybrid,
+            customer_name=request.customer_name,
+            account_number=request.account_number,
+            days_overdue=request.days_overdue,
+            amount_due=request.amount_due,
+            avatar_id=request.avatar_id,
+            voice_id=request.voice_id,
+            agent_name=request.agent_name,
+            voice_gender=request.voice_gender,
+            language=request.language,
+            heygen_output_format=request.heygen_output_format,
+        )
+
+        await set_progress(
+            "processing",
+            "Rendering VisionDesk video",
+            48,
+            {"job_data.raw_avatar": _to_mongo_safe(raw_avatar)},
+        )
+        render_result = await asyncio.to_thread(
+            render_hybrid_avatar_pip_video,
+            video_id=video_id,
+            avatar_video_path=raw_avatar["avatar_local_path"],
+            customer_name=request.customer_name,
+            account_number=request.account_number,
+            days_overdue=request.days_overdue,
+            collection_status=collection_status,
+            amount_due=request.amount_due,
+            agent_name=request.agent_name,
+            agent_role=request.agent_role,
+            aspect_mode=request.aspect_mode,
+            viewport_width=request.viewport_width,
+            viewport_height=request.viewport_height,
+            brand_name=request.brand_name,
+            brand_logo_path=request.brand_logo_path,
+            primary_color=request.primary_color,
+            secondary_color=request.secondary_color,
+            cta_buttons=request.cta_buttons,
+        )
+    except HybridAvatarGenerationError as exc:
+        await set_progress("failed", "Failed", 100, {"error": str(exc) or GENERIC_GENERATION_ERROR})
+        return
+    except HybridRenderError as exc:
+        await set_progress("failed", "Failed", 100, {"error": str(exc) or GENERIC_GENERATION_ERROR})
+        return
+    except ValueError as exc:
+        await set_progress("failed", "Failed", 100, {"error": str(exc)})
+        return
+    except Exception as exc:
+        logger.exception("Hybrid job %s failed.", video_id)
+        await set_progress("failed", "Failed", 100, {"error": str(exc) or GENERIC_GENERATION_ERROR})
+        return
+
+    final_source_path = Path(render_result["output_path"])
+    if not final_source_path.exists():
+        await set_progress("failed", "Failed", 100, {"error": "Hybrid render completed without a final MP4."})
+        return
+
+    await set_progress("processing", "Preparing final video", 75, {"job_data.render_result": _to_mongo_safe(render_result)})
+    public_filename = f"{video_id}.mp4"
+    public_path = HYBRID_PUBLIC_DIR / public_filename
+    shutil.copyfile(final_source_path, public_path)
+    local_final_video_url = f"/generated/{public_filename}"
+    stored_final_video_url = local_final_video_url
+    response_final_video_url = local_final_video_url
+    stored_interactive_url = None
+    response_interactive_url = None
+
+    await set_progress("processing", "Uploading video", 86)
+    s3_video_url = s3_service.upload_video(final_source_path, f"videos/{video_id}.mp4")
+    if s3_video_url:
+        stored_final_video_url = s3_video_url
+        response_final_video_url = s3_service.presign_s3_url(s3_video_url) or s3_video_url
+        await set_progress("processing", "Creating interactive page", 93)
+        s3_html_url = _upload_hybrid_avatar_pip_html(
+            video_id=video_id,
+            title=f"TVS Credit - {request.customer_name}",
+            video_url=response_final_video_url,
+            brand_name=request.brand_name or "TVS Credit",
+            primary_color=request.primary_color or "#005BAA",
+            secondary_color=request.secondary_color or "#19B6A3",
+            cta_buttons=request.cta_buttons,
+        )
+        if s3_html_url:
+            stored_interactive_url = s3_html_url
+            response_interactive_url = s3_service.presign_s3_url(s3_html_url) or s3_html_url
+
+    response = HybridRemotionAvatarPipResponse(
+        success=True,
+        raw_avatar_video_id=raw_avatar.get("heygen_video_id"),
+        raw_avatar_path=raw_avatar.get("avatar_local_path"),
+        final_video_path=str(public_path),
+        final_video_url=response_final_video_url,
+        interactive_url=response_interactive_url,
+        width=int(render_result["width"]),
+        height=int(render_result["height"]),
+        duration_seconds=render_result.get("duration_seconds"),
+    )
+    await set_progress("completed", "Completed", 100, {
+        "video_url": stored_final_video_url,
+        "interactive_url": stored_interactive_url,
+        "final_video_path": str(public_path),
+        "job_data.response": _to_mongo_safe(response),
+    })
+
+
+@app.get('/videos/{video_id}/status')
+async def get_video_status(
+    video_id: str,
+    request_mode: str = 'direct',
+    current_user: str = Depends(get_current_user),
+):
+    if request_mode.startswith('remotion') or request_mode.startswith('hybrid'):
+        doc = await videos_collection.find_one({"_id": _mongo_id(video_id)})
+        
+        # Safe logging without cp1252 crash
+        try:
+            print(f">>> found doc: {bool(doc)} {video_id}")
+        except:
+            pass
+            
+        if not doc:
+            raise HTTPException(status_code=404, detail="Video not found")
+            
+        normalized_mode = 'hybrid_remotion_avatar_pip' if request_mode.startswith('hybrid') else 'remotion'
+        return _response_video_job_result(_build_async_video_status_response(doc, normalized_mode))
+
+    result = service.get_video_status_result(video_id, request_mode=request_mode)
+    await _persist_video_job_result(current_user, result)
+    return _response_video_job_result(result)
+
+
+@app.post('/videos/{video_id}/stylize', response_model=StyledVideoResult)
+async def stylize_video(
+    video_id: str,
+    request: Request,
+    include_captions: bool = Form(False),
+    subtitle_color: str = Form('White'),
+    subtitle_position: str = Form('Bottom'),
+    transcript: str | None = Form(None),
+    logo_position: str = Form('Top Right'),
+    logo_opacity: int = Form(80),
+    logo_file: UploadFile | None = File(None),
+    current_user: str = Depends(get_current_user)
+):
+    print(f"DEBUG: Stylize request for video {video_id} by {current_user}")
+    stored_video = await videos_collection.find_one(
+        {
+            "user_id": current_user,
+            "$or": [
+                {"_id": _mongo_id(video_id)},
+                {"job_data.video_id": video_id},
+                {"result_payload.video_id": video_id},
+            ],
+        }
+    )
+    resolved_video_id = _stored_video_job_id(stored_video) if stored_video else None
+    try:
+        artifact = styling_service.style_video(
+            resolved_video_id or video_id,
+            StyleRequest(
+                include_captions=include_captions,
+                subtitle_color=subtitle_color,
+                subtitle_position=subtitle_position,
+                transcript=transcript,
+                logo_position=logo_position,
+                logo_opacity=logo_opacity,
+                logo_filename=logo_file.filename if logo_file else None,
+                logo_bytes=await logo_file.read() if logo_file else None,
+            ),
+        )
+    except ValueError as exc:
+        print(f"DEBUG: Stylize failed: {exc}")
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    final_relative = artifact.final_video_path.relative_to(settings.output_dir).as_posix()
+    video_url = f"/api/artifacts/{final_relative}"
+
+    s3_url = s3_service.upload_video(artifact.final_video_path, f"videos/{video_id}.mp4")
+    if s3_url:
+        video_url = s3_url
+
+    result = StyledVideoResult(
+        video_id=video_id,
+        status='styled',
+        source_video_path=artifact.source_video_path,
+        source_video_url=artifact.source_video_url,
+        final_video_path=artifact.final_video_path,
+        final_video_url=video_url,
+        subtitle_file_path=artifact.subtitle_file_path,
+        logo_file_path=artifact.logo_file_path,
+        subtitle_source=artifact.subtitle_source,
+    )
+
+    # Update MongoDB record
+    await videos_collection.update_one(
+        {
+            "user_id": current_user,
+            "$or": [
+                {"_id": _mongo_id(video_id)},
+                {"job_data.video_id": resolved_video_id or video_id},
+                {"result_payload.video_id": resolved_video_id or video_id},
+            ],
+        },
+        {"$set": {
+            "status": "styled",
+            "video_url": result.final_video_url,
+            "job_data": _to_mongo_safe(result)
+        }}
+    )
+    print(f"DEBUG: Stylize completed and updated in DB for video {video_id}")
+    return _response_styled_video_result(result)
+
+
+@app.post('/generate/template')
+async def generate_template(request: TemplateVideoRequest, wait: bool = True, current_user: str = Depends(get_current_user)):
+    print(f"DEBUG: Template generation request by {current_user}")
+    result = service.generate_from_template(request, wait=wait)
+
+    if wait and result.saved_to:
+        s3_url = s3_service.upload_video(result.saved_to, f"videos/{result.video_id}.mp4")
+        if s3_url:
+            result.video_url = s3_url
+
+    # Save to MongoDB
+    video_record = VideoRecord(
+        user_id=current_user,
+        status="completed" if wait else "processing",
+        title=f"Template Video - {request.customer_name}",
+        request_mode="template",
+        job_data=_to_mongo_safe(result)
+    )
+    await videos_collection.insert_one(_to_mongo_safe(video_record))
+    print(f"DEBUG: Template generation saved to DB")
+    return _response_video_job_result(result)
+
+
+@app.post('/generate/remotion', response_model=VideoJobResult)
+async def generate_remotion(request: Request, current_user: str = Depends(get_current_user)):
+
+    payload = await _parse_remotion_payload(request)
+    if payload.template_key in PORTRAIT_REMOTION_TEMPLATE_KEYS:
+        payload.video_width = 1080
+        payload.video_height = 1920
+    logger.info(f"Remotion video payload ended:")
+    # 1. Create a deterministic hash of the entire configuration payload
+    payload_dict = payload.model_dump(exclude_none=True)
+    if 'logo_bytes' in payload_dict and payload_dict['logo_bytes']:
+        payload_dict['logo_bytes'] = str(len(payload_dict['logo_bytes']))
+    if 'loan_reminder_image_bytes' in payload_dict and payload_dict['loan_reminder_image_bytes']:
+        payload_dict['loan_reminder_image_bytes'] = {
+            key: len(value) if isinstance(value, (bytes, bytearray)) else str(value)
+            for key, value in payload_dict['loan_reminder_image_bytes'].items()
+        }
+    if 'sales_image_bytes' in payload_dict and payload_dict['sales_image_bytes']:
+        payload_dict['sales_image_bytes'] = {
+            key: len(value) if isinstance(value, (bytes, bytearray)) else str(value)
+            for key, value in payload_dict['sales_image_bytes'].items()
+        }
+    if 'emi_image_bytes' in payload_dict and payload_dict['emi_image_bytes']:
+        payload_dict['emi_image_bytes'] = {
+            key: len(value) if isinstance(value, (bytes, bytearray)) else str(value)
+            for key, value in payload_dict['emi_image_bytes'].items()
+        }
+    
+    payload_str = json.dumps(payload_dict, sort_keys=True, ensure_ascii=False)
+    payload_hash = hashlib.sha256(payload_str.encode('utf-8')).hexdigest()
+
+    # 2. Check Database for an identical completed video globally
+    cached_record = await videos_collection.find_one({
+        "request_mode": "remotion",
+        "status": "completed",
+        "job_data.payload_hash": payload_hash
+    })
+
+    if cached_record and cached_record.get('job_data'):
+        # Reconstruct the VideoJobResult from the stored dataset directly
+        job_data = cached_record['job_data'].copy()
+        job_data.pop('payload_hash', None)
+        interactive_url = _interactive_remotion_url(
+            str(cached_record.get('_id') or job_data.get('video_id') or ''),
+            payload.template_key,
+        )
+        stored_interactive_url = cached_record.get('interactive_url')
+        if stored_interactive_url:
+            interactive_url = str(stored_interactive_url)
+        if interactive_url:
+            job_data['interactive_url'] = interactive_url
+        return _response_video_job_result(VideoJobResult(**job_data))
+
+    from bson import ObjectId
+    video_id = str(ObjectId())
+    logger.info(f"Initialized new Remotion video job with ID: {video_id}")
+
+    # Build the queued result
+    job_result = VideoJobResult(
+        request_mode='remotion',
+        video_id=video_id,
+        status='queued',
+        phase='Queued',
+        progress=5,
+        video_url=None,
+        thumbnail_url=None,
+        title=f"{payload.title_prefix} - {payload.customer_name} - {payload.lan}",
+        raw_response={},
+        saved_to=None,
+        interactive_url=_interactive_remotion_url(video_id, payload.template_key),
+    )
+
+    embeddable_job_data = {
+        'payload_hash': f"{payload_hash}_{time.time()}",
+        'request_payload': _to_mongo_safe(payload),
+        'request_mode': 'remotion',
+        'phase': 'Queued',
+        'progress': 5,
+    }
+
+    video_record = VideoRecord(
+        user_id=current_user,
+        status="queued",
+        title=f"{payload.title_prefix} - {payload.customer_name} - {payload.lan}",
+        video_url=None,
+        request_mode="remotion_async",
+        job_data=embeddable_job_data
+    )
+    
+    video_record_dict = _to_mongo_safe(video_record)
+    if isinstance(video_record_dict, dict):
+        video_record_dict.update({'phase': 'Queued', 'progress': 5})
+    
+    insert_result = await videos_collection.insert_one(video_record_dict)
+    video_id = str(insert_result.inserted_id)
+    
+    # Build the queued result using the MongoDB-generated ID
+    job_result = VideoJobResult(
+        request_mode='remotion',
+        video_id=video_id,
+        status='queued',
+        phase='Queued',
+        progress=5,
+        video_url=None,
+        thumbnail_url=None,
+        title=f"{payload.title_prefix} - {payload.customer_name} - {payload.lan}",
+        raw_response={},
+        saved_to=None,
+        interactive_url=_interactive_remotion_url(video_id, payload.template_key),
+    )
+    
+    if payload.template_key in LOCAL_REMOTION_WORKER_TEMPLATE_KEYS:
+        # This template depends on newly bundled local screenshot assets. Keep it
+        # on the current runtime so an older shared SQS worker cannot claim it and
+        # render the account-notice fallback.
+        logger.info(
+            "Interactive Remotion job %s will be rendered by the local Remotion worker.",
+            video_id,
+        )
+        asyncio.create_task(RemotionJobWorker()._process_job(video_id, None))
+    else:
+        # NOTE: Render and S3 Upload logic has been moved to the RemotionJobWorker
+        # for asynchronous processing to prevent API timeouts.
+        logger.info(f"Job record {video_id} persisted to database. Handing off to SQS queue...")
+
+        # 3. Submit to SQS
+        try:
+            from app.services.sqs_service import SQSService
+            from app.constants import SQS_QUEUE_URL
+            sqs_svc = SQSService()
+            sqs_svc.send_job(
+                payload={
+                    '_id': video_id,
+                    'request_mode': 'remotion'
+                },
+                queue_url=SQS_QUEUE_URL
+            )
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            with open("sqs_fail.log", "a") as f:
+                f.write(f"SQS FAIL: {e}\n{traceback.format_exc()}\n")
+            await videos_collection.delete_one({'_id': _mongo_id(video_id)})
+            raise HTTPException(status_code=500, detail=f"Failed to enqueue remotion video generation: {e}")
+
+        # Local development fallback: process the job in the current API process
+        # immediately as well. The worker claims only queued jobs, so this does not
+        # double-render when SQS polling is healthy.
+        asyncio.create_task(RemotionJobWorker()._process_job(video_id, None))
+
+    # Return the 'queued' result instantly.
+    # The background worker will handle the render and update the DB status.
+    # The frontend will poll for status until completion.
+    logger.info(f"Remotion job enqueued: {video_id}. Returning success now.")
+    return _response_video_job_result(job_result)
+
+
+@app.get('/my-videos')
+async def get_my_videos(current_user: str = Depends(get_current_user)):
+    try:
+        logger.info("Loading /my-videos for user %s", current_user)
+        cursor = videos_collection.find({"user_id": current_user}).sort("created_at", -1)
+        videos = await cursor.to_list(length=100)
+        logger.info("Loaded %d videos for user %s", len(videos), current_user)
+
+        refresh_candidates = [
+            video
+            for video in videos
+            if video.get("status") == "processing" and video.get("request_mode") in {"direct", "template"}
+        ]
+        logger.info(
+            "Found %d processing videos to refresh for user %s",
+            len(refresh_candidates),
+            current_user,
+        )
+
+        if refresh_candidates:
+            refresh_results = await asyncio.gather(
+                *(_refresh_processing_video(video, current_user) for video in refresh_candidates),
+                return_exceptions=True,
+            )
+            for index, refresh_result in enumerate(refresh_results):
+                if isinstance(refresh_result, Exception):
+                    logger.exception(
+                        "Failed to refresh processing video for user %s at refresh index %d: %s",
+                        current_user,
+                        index,
+                        refresh_result,
+                    )
+
+        serialized_videos: list[dict[str, Any]] = []
+        serialization_failures = 0
+        for video in videos:
+            try:
+                serialized_videos.append(_serialize_my_video(video))
+            except Exception as exc:
+                serialization_failures += 1
+                logger.exception(
+                    "Failed to serialize /my-videos item | user=%s | snapshot=%s | error=%s",
+                    current_user,
+                    json.dumps(_video_log_snapshot(video), default=str),
+                    exc,
+                )
+
+            # Preserve payloads for frontend auto-fill logic in Bulk Send
+            # video.pop("request_payload", None)
+            # video.pop("result_payload", None)
+            video.pop("job_data", None)
+
+        logger.info(
+            "Returning %d serialized videos for user %s (serialization_failures=%d)",
+            len(serialized_videos),
+            current_user,
+            serialization_failures,
+        )
+        return serialized_videos
+    except Exception as exc:
+        logger.exception("Fatal /my-videos failure for user %s: %s", current_user, exc)
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to load your video library. Check backend logs for the exact failing step.",
+        ) from exc
+    
+
+@app.get('/videos/{video_id}')
+async def get_video_details(video_id: str, current_user: str = Depends(get_current_user)):
+    """Fetch details for a single video. Accessible by owner or admin."""
+    logger.info("Loading /videos/%s for user %s", video_id, current_user)
+    video = await videos_collection.find_one({"_id": _mongo_id(video_id)})
+    if not video:
+        logger.warning("Video %s not found for user %s", video_id, current_user)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Video not found")
+
+    # Check permissions: owner or admin
+    is_admin = False
+    current_user_email: str | None = None
+    try:
+        user = await users_collection.find_one({"_id": _mongo_id(current_user)})
+        if user and user.get("is_admin"):
+            is_admin = True
+        if user and user.get("email"):
+            current_user_email = str(user.get("email"))
+    except:
+        pass
+
+    logger.info(
+        "Fetched /videos/%s record | current_user=%s | current_user_email=%s | video_user_id=%s | is_admin=%s",
+        video_id,
+        current_user,
+        current_user_email,
+        str(video.get("user_id") or ""),
+        is_admin,
+    )
+
+    if video.get("user_id") not in {current_user, current_user_email} and not is_admin:
+        logger.warning(
+            "Forbidden /videos/%s | current_user=%s | current_user_email=%s | video_user_id=%s | is_admin=%s",
+            video_id,
+            current_user,
+            current_user_email,
+            str(video.get("user_id") or ""),
+            is_admin,
+        )
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+
+    video["_id"] = str(video["_id"])
+    url = video.get("video_url")
+    if url and isinstance(url, str) and "/artifacts/" in url:
+        video["video_url"] = "/api/artifacts/" + url.split("/artifacts/", 1)[1]
+    elif isinstance(url, str):
+        video["video_url"] = s3_service.presign_s3_url(url)
+
+    job_data = video.get("job_data") if isinstance(video.get("job_data"), dict) else {}
+    request_payload = job_data.get("request_payload") if isinstance(job_data.get("request_payload"), dict) else {}
+    stored_interactive_url = str(video.get("interactive_url")) if video.get("interactive_url") else None
+    interactive_url = s3_service.presign_s3_url(stored_interactive_url) or _interactive_remotion_url(str(video["_id"]), request_payload.get("template_key"))
+    if interactive_url:
+        video["interactive_url"] = interactive_url
+    
+    video.pop("job_data", None)
+    return video
+
+
+@app.get('/interactive/loan-offer/{video_id}')
+async def get_interactive_loan_offer(video_id: str):
+    video = await videos_collection.find_one({"_id": _mongo_id(video_id)})
+    if not video:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interactive video not found")
+
+    job_data = video.get("job_data") if isinstance(video.get("job_data"), dict) else {}
+    request_payload = job_data.get("request_payload") if isinstance(job_data.get("request_payload"), dict) else {}
+    if request_payload.get("template_key") != "loan_offer_interactive":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interactive loan offer not found")
+
+    raw_url = video.get("video_url")
+    if isinstance(raw_url, str) and "/artifacts/" in raw_url:
+        video_url = "/api/artifacts/" + raw_url.split("/artifacts/", 1)[1]
+    elif isinstance(raw_url, str):
+        video_url = s3_service.presign_s3_url(raw_url)
+    else:
+        video_url = None
+
+    if not video_url:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Interactive video is still processing")
+
+    def field(name: str, fallback: object = "") -> object:
+        value = request_payload.get(name)
+        return fallback if value is None or str(value).strip() == "" else value
+
+    return {
+        "id": str(video.get("_id") or video_id),
+        "title": str(video.get("title") or "Interactive Loan Offer"),
+        "video_url": video_url,
+        "customer_name": field("customer_name", "Customer"),
+        "client_name": field("client_name", "Finance Partner"),
+        "contact_details": field("contact_details", "1800-555-999"),
+        "primary_color": field("primary_color", "#053666"),
+        "secondary_color": field("secondary_color", "#0f7734"),
+        "interactive_background_color": field("interactive_background_color", "#f5f7fb"),
+        "interactive_cta_color": field("interactive_cta_color", "#702082"),
+        "loan_offer": {
+            "max_loan_amount": field("max_loan_amount", field("loan_amount", "105000")),
+            "max_tenure": field("max_tenure", "60"),
+            "max_emi": field("max_emi", field("tos", "3398")),
+            "loan_id": field("loan_id", field("lan", "")),
+            "cta_phone_number": field("cta_phone_number", field("contact_details", "1800-555-999")),
+            "month_24_loan_amount": field("month_24_loan_amount", "75000"),
+            "month_30_loan_amount": field("month_30_loan_amount", "90000"),
+            "month_36_loan_amount": field("month_36_loan_amount", "105000"),
+            "month_42_loan_amount": field("month_42_loan_amount", "NA"),
+            "month_48_loan_amount": field("month_48_loan_amount", "NA"),
+            "month_60_loan_amount": field("month_60_loan_amount", field("max_loan_amount", "105000")),
+            "emi_calculation24": field("emi_calculation24", ""),
+            "emi_calculation30": field("emi_calculation30", ""),
+            "emi_calculation36": field("emi_calculation36", ""),
+            "emi_calculation42": field("emi_calculation42", ""),
+            "emi_calculation48": field("emi_calculation48", ""),
+            "emi_calculation60": field("emi_calculation60", field("max_emi", "3398")),
+        },
+        "subtitles": video.get("subtitles") or [],
+    }
+
+
+@app.get('/interactive/loan-reminder/{video_id}')
+async def get_interactive_loan_reminder(video_id: str):
+    video = await videos_collection.find_one({"_id": _mongo_id(video_id)})
+    if not video:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interactive video not found")
+
+    job_data = video.get("job_data") if isinstance(video.get("job_data"), dict) else {}
+    request_payload = job_data.get("request_payload") if isinstance(job_data.get("request_payload"), dict) else {}
+    if request_payload.get("template_key") not in {"loan_reminder", "collection_reminder"}:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interactive loan reminder not found")
+
+    raw_url = video.get("video_url")
+    if isinstance(raw_url, str) and "/artifacts/" in raw_url:
+        video_url = "/api/artifacts/" + raw_url.split("/artifacts/", 1)[1]
+    elif isinstance(raw_url, str):
+        video_url = s3_service.presign_s3_url(raw_url)
+    else:
+        video_url = None
+
+    if not video_url:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Interactive video is still processing")
+
+    def field(name: str, fallback: object = "") -> object:
+        value = request_payload.get(name)
+        return fallback if value is None or str(value).strip() == "" else value
+
+    return {
+        "id": str(video.get("_id") or video_id),
+        "title": str(video.get("title") or "Loan Reminder"),
+        "video_url": video_url,
+        "payment_url": field("payment_url", ""),
+        "contact_details": field("contact_details", "1800-555-999"),
+    }
+
+
+@app.get('/interactive/sales/{video_id}')
+async def get_interactive_sales(video_id: str):
+    video = await videos_collection.find_one({"_id": _mongo_id(video_id)})
+    if not video:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interactive video not found")
+
+    job_data = video.get("job_data") if isinstance(video.get("job_data"), dict) else {}
+    request_payload = job_data.get("request_payload") if isinstance(job_data.get("request_payload"), dict) else {}
+    if request_payload.get("template_key") != "scene_loan_offer":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interactive sales video not found")
+
+    raw_url = video.get("video_url")
+    if isinstance(raw_url, str) and "/artifacts/" in raw_url:
+        video_url = "/api/artifacts/" + raw_url.split("/artifacts/", 1)[1]
+    elif isinstance(raw_url, str):
+        video_url = s3_service.presign_s3_url(raw_url)
+    else:
+        video_url = None
+
+    if not video_url:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Interactive video is still processing")
+
+    def field(name: str, fallback: object = "") -> object:
+        value = request_payload.get(name)
+        return fallback if value is None or str(value).strip() == "" else value
+
+    return {
+        "id": str(video.get("_id") or video_id),
+        "title": str(video.get("title") or "Sales Offer"),
+        "video_url": video_url,
+        "customer_name": field("customer_name", "Customer"),
+        "sales_cta_label": field("sales_cta_label", ""),
+        "sales_cta_url": field("sales_cta_url", ""),
+    }
+
+
+@app.post('/interactive/loan-offer/{video_id}/events')
+async def record_interactive_loan_offer_event(video_id: str, event: LoanOfferInteractionEvent):
+    update = {
+        "action": event.action,
+        "selected_loan_amount": event.selected_loan_amount,
+        "selected_tenure": event.selected_tenure,
+        "selected_emi": event.selected_emi,
+        "created_at": now_ist().isoformat(),
+    }
+    result = await videos_collection.update_one(
+        {"_id": _mongo_id(video_id), "job_data.request_payload.template_key": "loan_offer_interactive"},
+        {"$push": {"interaction_events": update}},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interactive loan offer not found")
+    return {"status": "ok"}
+
+
+@app.get('/custom-avatars')
+async def get_custom_avatars():
+    """Returns metadata for precisely matched custom Indian avatars (like Adv. Mahesh).
+    Different from /jobs/avatar which is used to submit a real generation job."""
+    cursor = custom_avatars_collection.find({})
+    avatars = await cursor.to_list(length=100)
+    for av in avatars:
+        av["_id"] = str(av["_id"])
+    return avatars
+
+@app.get('/ping')
+async def ping():
+    return {"status": "ok"}
+
+@app.post('/preview/voice')
+async def preview_voice(
+    language: str = Form(...),
+    gender: str = Form(...),
+    text: str = Form(None),
+    voice_id: Optional[str] = Form(None),
+    current_user: str = Depends(get_current_user)
+):
+    print(f"DEBUG: Voice preview request - lang: {language}, gender: {gender}, voice_id: {voice_id}, text_len: {len(text or '') if text else 0}")
+    
+    # If we have a HeyGen voice_id, try using HeyGen's TTS for a perfectly matched preview
+    if voice_id and not (voice_id.startswith("en-") or voice_id.startswith("hi-") or "-" in voice_id and len(voice_id) < 20):
+        try:
+            tts_resp = client.generate_tts(voice_id, text or "")
+            audio_url = tts_resp.get("data", {}).get("audio_url")
+            if audio_url:
+                # Proxy the HeyGen audio URL to avoid CORS and ensure stability
+                import httpx
+                from fastapi.responses import StreamingResponse
+                
+                async def stream_audio():
+                    async with httpx.AsyncClient(follow_redirects=True) as c:
+                        try:
+                            async with c.stream('GET', audio_url) as response:
+                                if response.status_code >= 400:
+                                    print(f"DEBUG: HeyGen TTS stream failed with status {response.status_code}")
+                                async for chunk in response.aiter_bytes():
+                                    yield chunk
+                        except Exception as e:
+                            print(f"DEBUG: HeyGen TTS stream exception: {e}")
+                return StreamingResponse(stream_audio(), media_type="audio/mpeg")
+        except Exception as e:
+            print(f"DEBUG: HeyGen TTS failed, falling back to edge-tts: {e}")
+    
+    # Fallback to RemotionService/edge-tts if HeyGen failed or wasn't attempted
+    try:
+        from app.services.remotion_service import RemotionService
+        from app.models import LeadRecord, DirectVideoRequest
+        from app.services.script_renderer import build_context, _normalize_placeholder_syntax
+        from jinja2 import Environment
+        
+        # Safe defaults for the preview context
+        dummy_lead = LeadRecord(
+            customer_name="Ramesh Kumar",
+            lan="LAN12345",
+            client_name="TVS Credit",
+            tos="38450",
+            loan_amount="120000",
+            contact_details="1800-555-999",
+            product_type="loan"
+        )
+        # We don't pass language to LeadRecord because it's not a field there
+        context = build_context(dummy_lead)
+        
+        # Render the preview text if it contains placeholders
+        preview_text = text or "Hello, this is a voice preview."
+        try:
+            env = Environment()
+            template = env.from_string(_normalize_placeholder_syntax(preview_text))
+            final_text = template.render(**context)
+        except Exception:
+            final_text = preview_text
+
+        import tempfile
+        import subprocess
+        import os
+        from app.services.remotion_service import normalize_hindi_numbers, VOICE_MAP
+        
+        voice_key = f"{language}-{gender.capitalize()}"
+        voice = VOICE_MAP.get(voice_key, "hi-IN-SwaraNeural")
+        
+        if language == "Hindi":
+            final_text = normalize_hindi_numbers(final_text)
+
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt', encoding='utf-8') as f:
+            f.write(final_text)
+            temp_text_file = f.name
+            
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as out_f:
+            audio_path = out_f.name
+
+        import sys
+        command = f'"{sys.executable}" -m edge_tts --voice "{voice}" --file "{temp_text_file}" --write-media "{audio_path}"'
+        
+        def run_tts():
+            with tempfile.NamedTemporaryFile() as out_l, tempfile.NamedTemporaryFile() as err_l:
+                result = subprocess.run(command, shell=True, stdout=out_l, stderr=err_l, stdin=subprocess.DEVNULL)
+                err_l.seek(0)
+                if result.returncode != 0:
+                    raise Exception(f"Voice preview TTS failed: {err_l.read().decode('utf-8', errors='ignore')}")
+
+        await asyncio.to_thread(run_tts)
+        
+        try:
+            os.remove(temp_text_file)
+        except:
+            pass
+            
+        if not Path(audio_path).exists():
+            raise HTTPException(status_code=500, detail="Generated audio file not found")
+
+        return FileResponse(
+            audio_path,
+            media_type="audio/mpeg",
+            filename=f"preview_{language}_{gender}.mp3"
+        )
+    except Exception as exc:
+        import traceback
+        error_msg = f"ERROR in preview_voice: {str(exc)}\n{traceback.format_exc()}"
+        print(error_msg)
+        try:
+            debug_file = Path("c:/Users/RentoBees/Desktop/vid_fix/debug_preview.log")
+            with open(debug_file, "a", encoding="utf-8") as f:
+                f.write(f"\n--- {datetime.now()} ---\n{error_msg}\n")
+        except:
+            pass
+        raise HTTPException(status_code=500, detail=str(exc))
+
+@app.delete('/videos/{video_id}')
+async def delete_video(video_id: str, current_user: str = Depends(get_current_user)):
+    print(f"DEBUG: Delete request for video {video_id} by {current_user}")
+    result = await videos_collection.delete_one({"_id": _mongo_id(video_id), "user_id": current_user})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Video not found")
+    return {"status": "success", "message": "Video deleted successfully"}
+
+@app.post('/drafts/save')
+async def save_draft(draft: dict, current_user: str = Depends(get_current_user)):
+    print(f"DEBUG: Saving draft for {current_user}")
+    now = now_ist()
+    result = await drafts_collection.update_one(
+        {"user_id": current_user},
+        {"$set": {
+            "content": draft,
+            "updated_at": now,
+        }, "$setOnInsert": {
+            "created_at": now,
+        }},
+        upsert=True,
+    )
+    draft_doc = await drafts_collection.find_one({"user_id": current_user}, sort=[("updated_at", -1)])
+    draft_id = str(draft_doc["_id"]) if draft_doc else str(result.upserted_id or "latest")
+    return {"status": "success", "draft_id": draft_id}
+
+@app.get('/drafts')
+async def get_drafts(current_user: str = Depends(get_current_user)):
+    print(f"DEBUG: Fetching drafts for {current_user}")
+    cursor = drafts_collection.find({"user_id": current_user}).sort("updated_at", -1)
+    drafts = await cursor.to_list(length=50)
+    for d in drafts:
+        d["_id"] = str(d["_id"])
+    return drafts
+
+
+# --- Admin Endpoints ---
+
+
+@app.get('/admin/stats')
+async def get_admin_stats(admin: dict = Depends(get_current_admin)):
+    total_users = await users_collection.count_documents({})
+    total_videos = await videos_collection.count_documents({})
+    completed = await videos_collection.count_documents({"status": "completed"})
+    queued = await videos_collection.count_documents({"status": "queued"})
+    failed = await videos_collection.count_documents({"status": "failed"})
+    remotion = await videos_collection.count_documents({"request_mode": {"$in": ["remotion", "remotion_async"]}})
+    direct = await videos_collection.count_documents({"request_mode": "direct"})
+    template = await videos_collection.count_documents({"request_mode": "template"})
+
+    return {
+        'total_users': total_users,
+        'total_videos': total_videos,
+        'completed': completed,
+        'queued': queued,
+        'failed': failed,
+        'remotion': remotion,
+        'direct': direct,
+        'template': template,
+        'status': 'online'
+    }
+
+
+@app.get('/admin/users')
+
+async def get_admin_users(admin: dict = Depends(get_current_admin)):
+    cursor = users_collection.find({})
+    users = await cursor.to_list(length=500)
+
+    results = []
+    for u in users:
+        u_id = str(u['_id'])
+        video_count = await videos_collection.count_documents({'user_id': u_id})
+        if video_count == 0:
+            video_count = await videos_collection.count_documents({'user_id': u['email']})
+        completed = await videos_collection.count_documents({'user_id': u_id, 'status': 'completed'})
+
+        results.append({
+            'id': u_id,
+            'email': u['email'],
+            'full_name': u.get('full_name', 'N/A'),
+            'video_count': video_count,
+            'completed_count': completed,
+            'is_admin': u.get('is_admin', False),
+            'disabled': u.get('disabled', False),
+        })
+    return results
+
+@app.get('/admin/users/{user_id}/videos')
+async def get_user_videos_admin(user_id: str, admin: dict = Depends(get_current_admin)):
+    """Fetch all videos for a specific user (admin only)."""
+    try:
+        oid = ObjectId(user_id) if ObjectId.is_valid(user_id) else user_id
+        user = await users_collection.find_one({"_id": oid})
+    except:
+        user = None
+
+    conditions = [{"user_id": user_id}]
+    if user:
+        conditions.append({"user_id": user.get("email", "")})
+
+    cursor = videos_collection.find({"$or": conditions}).sort("created_at", -1)
+    videos = await cursor.to_list(length=200)
+    for v in videos:
+        v['_id'] = str(v['_id'])
+        url = v.get('video_url')
+        if url and isinstance(url, str) and not "/artifacts/" in url:
+            v['video_url'] = s3_service.presign_s3_url(url)
+        v.pop('job_data', None)
+    return videos
+
+@app.get('/admin/all-videos')
+async def get_all_videos(search: str = "", status: str = "", admin: dict = Depends(get_current_admin)):
+    query: dict = {}
+    if status:
+        query["status"] = status
+    if search:
+        query["$or"] = [
+            {"title": {"$regex": search, "$options": "i"}},
+            {"user_id": {"$regex": search, "$options": "i"}},
+        ]
+    cursor = videos_collection.find(query).sort('created_at', -1)
+    videos = await cursor.to_list(length=200)
+    for v in videos:
+        v['_id'] = str(v['_id'])
+        url = v.get('video_url')
+        if url and isinstance(url, str) and not "/artifacts/" in url:
+            v['video_url'] = s3_service.presign_s3_url(url)
+        v.pop('job_data', None)
+    return videos
+
+@app.delete('/admin/videos/{video_id}')
+async def admin_delete_video(video_id: str, admin: dict = Depends(get_current_admin)):
+    """Admin can delete any video."""
+    result = await videos_collection.delete_one({"_id": _mongo_id(video_id)})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Video not found")
+    return {"status": "deleted"}
+
+# --- WhatsApp Campaign Analytics & Webhooks ---
+
+@app.post('/meta/whatsapp-webhook')
+async def whatsapp_webhook(request: Request):
+    """Receives delivery status updates from Infobip Bridge."""
+    try:
+        data = await request.json()
+        # Infobip format: { "results": [ { "messageId": "...", "status": { "groupName": "DELIVERED" } } ] }
+        results = data.get("results", [])
+        for res in results:
+            m_id = res.get("messageId")
+            status_group = res.get("status", {}).get("groupName", "UNKNOWN")
+            if m_id:
+                from app.database import whatsapp_logs_collection
+                await whatsapp_logs_collection.update_one(
+                    {"message_id": m_id},
+                    {"$set": {
+                        "status": status_group,
+                        "updated_at": now_ist()
+                    }}
+                )
+        return {"status": "ok"}
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+        return {"status": "error", "message": str(e)}
+
+@app.get('/admin/campaign-analytics')
+async def get_campaign_analytics(admin: dict = Depends(get_current_admin)):
+    """Aggregates WhatsApp logs for the admin dashboard."""
+    try:
+        from app.database import whatsapp_logs_collection
+        pipeline = [
+            {"$group": {
+                "_id": "$status",
+                "count": {"$sum": 1}
+            }}
+        ]
+        cursor = whatsapp_logs_collection.aggregate(pipeline)
+        stats = await cursor.to_list(length=20)
+        
+        # Format as dictionary for easier charting
+        formatted = {s["_id"]: s["count"] for s in stats}
+        
+        # Recent logs for the table
+        recent_cursor = whatsapp_logs_collection.find({}).sort("created_at", -1).limit(50)
+        recent_logs = await recent_cursor.to_list(length=50)
+        for log in recent_logs:
+            log["_id"] = str(log["_id"])
+            
+        return {
+            "summary": formatted,
+            "recent": recent_logs
+        }
+    except Exception as e:
+        logger.error(f"Analytics error: {e}")
+        return {"summary": {}, "recent": []}
+
+@app.post('/admin/whatsapp-logs')
+async def log_whatsapp_attempt(data: dict, admin: dict = Depends(get_current_admin)):
+    """Helper to log a new send attempt from the frontend."""
+    try:
+        from app.database import whatsapp_logs_collection
+        log_entry = {
+            "message_id": data.get("message_id"),
+            "phone": data.get("phone"),
+            "customer_name": data.get("customer_name"),
+            "template_id": data.get("template_id"),
+            "status": "SENT",
+            "created_at": now_ist(),
+            "updated_at": now_ist()
+        }
+        await whatsapp_logs_collection.insert_one(log_entry)
+        return {"status": "logged"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+        await whatsapp_logs_collection.insert_one(log_entry)
+        return {"status": "logged"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.post('/pdf/bulk-csv')
+@app.post('/api/pdf/bulk-csv')
+async def bulk_process_csv(
+    file: UploadFile = File(...),
+    current_user: str = Depends(get_current_user)
+):
+    """
+    Accepts a CSV mapping (phone_number, pdf_link, language) and kicks off background processing.
+    """
+    import csv
+    import io
+    from app.database import pdf_collection
+
+    try:
+        content = await file.read()
+        stream = io.StringIO(content.decode('utf-8'))
+        reader = csv.DictReader(stream)
+        
+        batch_ids = []
+        skipped_rows = 0
+
+        def _normalize_row(row: dict[str, Any]) -> dict[str, str]:
+            normalized: dict[str, str] = {}
+            for key, value in row.items():
+                cleaned_key = str(key or "").strip().lstrip("\ufeff").lower().replace(" ", "_")
+                cleaned_value = "" if value is None else str(value).strip()
+                normalized[cleaned_key] = cleaned_value
+            return normalized
+
+        def _first_present(row: dict[str, str], *keys: str) -> str:
+            for key in keys:
+                value = row.get(key, "").strip()
+                if value:
+                    return value
+            return ""
+
+        for row in reader:
+            normalized_row = _normalize_row(row)
+            phone = _first_present(
+                normalized_row,
+                "phone_number",
+                "phone",
+                "mobile",
+                "mobile_number",
+                "contact_number",
+                "whatsapp",
+                "whatsapp_number",
+            )
+            url = _first_present(
+                normalized_row,
+                "pdf_link",
+                "pdf_url",
+                "url",
+                "link",
+                "source",
+                "source_url",
+            )
+            lang = _first_present(normalized_row, "language", "lang", "language_name") or "Hindi"
+
+            if not phone or not url:
+                skipped_rows += 1
+                logger.warning(
+                    "Skipping bulk CSV row due to missing phone or url | phone=%s | url_present=%s | headers=%s",
+                    phone,
+                    bool(url),
+                    sorted(normalized_row.keys()),
+                )
+                continue
+
+            # Create entry in "pdf_summaries" collection
+            record = PDFRecord(
+                user_id=current_user,
+                phone_number=phone,
+                language=lang,
+                pdf_url=url,
+                filename=url.split('/')[-1] if '/' in url else "notice.pdf",
+                status='pending'
+            )
+            
+            res = await pdf_collection.insert_one(record.model_dump())
+            record_id = str(res.inserted_id)
+            batch_ids.append(record_id)
+
+            # Fire and forget background task
+            asyncio.create_task(process_single_bulk_item(record_id, lang))
+
+        return {
+            "status": "success",
+            "batch_size": len(batch_ids),
+            "skipped_rows": skipped_rows,
+            "ids": batch_ids,
+        }
+    except Exception as e:
+        logger.error(f"Bulk CSV error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+async def process_single_bulk_item(record_id: str, language: str):
+    """
+    Worker function to process one bulk PDF from a URL.
+    """
+    from app.database import pdf_collection
+
+    try:
+        # 1. Update status to downloading
+        await pdf_collection.update_one(
+            {"_id": ObjectId(record_id)},
+            {"$set": {"status": "downloading", "updated_at": now_ist()}}
+        )
+
+        # 2. Extract text from URL (Stream-to-Memory)
+        doc_record = await pdf_collection.find_one({"_id": ObjectId(record_id)})
+        doc_text = await pdf_service.extract_text_from_url(doc_record['pdf_url'])
+
+        # 3. Summarize (Summary via AI, next actions start blank for user input)
+        await pdf_collection.update_one(
+            {"_id": ObjectId(record_id)},
+            {"$set": {"status": "summarizing", "original_text": doc_text}}
+        )
+        
+        # Generate Summary
+        summary = await summarization_service.summarize_text(doc_text, target_language=language)
+        next_actions = ""
+
+        # 4. Generate Audio for both
+        audio_url = await audio_service.generate_audio(
+            pdf_id=record_id,
+            text=summary,
+            language=language,
+            gender="Female",
+            prefix="summary"
+        )
+        
+        next_actions_audio_url = None
+        if next_actions.strip():
+            try:
+                next_actions_audio_url = await audio_service.generate_audio(
+                    pdf_id=record_id,
+                    text=next_actions,
+                    language=language,
+                    gender="Female",
+                    prefix="next_actions"
+                )
+            except Exception as e:
+                logger.warning(f"Bulk Next-actions audio generation failed for {record_id}: {e}")
+
+        # 5. Finalize
+        update_fields = {
+            "status": "completed",
+            "summary_text": summary,
+            "audio_url": audio_url,
+            "next_actions_text": next_actions,
+            "updated_at": now_ist()
+        }
+        if next_actions_audio_url:
+            update_fields["next_actions_audio_url"] = next_actions_audio_url
+
+        await pdf_collection.update_one(
+            {"_id": ObjectId(record_id)},
+            {"$set": update_fields}
+        )
+        logger.info(f"Bulk item {record_id} completed successfully.")
+
+    except Exception as e:
+        logger.error(f"Failed processing bulk item {record_id}: {e}")
+        await pdf_collection.update_one(
+            {"_id": ObjectId(record_id)},
+            {"$set": {"status": "failed", "error": str(e), "updated_at": now_ist()}}
+        )
+
+@app.get('/api/pdf/{record_id}/status')
+async def get_pdf_status(record_id: str, current_user: str = Depends(get_current_user)):
+    """
+    Returns the processing status of a specific PDF item.
+    """
+    record = await pdf_collection.find_one({"_id": ObjectId(record_id), "user_id": current_user})
+    if not record:
+        raise HTTPException(status_code=404, detail="Bulk record not found")
+    
+    return {
+        "status": record.get("status"),
+        "phone_number": record.get("phone_number"),
+        "language": record.get("language"),
+        "summary": record.get("summary_text"),
+        "next_actions": record.get("next_actions_text"),
+        "audio_url": record.get("audio_url"),
+        "next_actions_audio_url": record.get("next_actions_audio_url"),
+        "pdf_url": record.get("pdf_url"),
+        "filename": record.get("filename"),
+        "error": record.get("error")
+    }

@@ -1,0 +1,104 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=Space+Grotesk:wght@400;500;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 285 60% 8%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 285 60% 8%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 285 60% 8%;
+
+    /* #5F1284 — deep royal purple */
+    --primary: 285 77% 29%;
+    --primary-foreground: 0 0% 100%;
+
+    /* #F5E8FE — soft lavender */
+    --secondary: 286 94% 96%;
+    --secondary-foreground: 285 60% 8%;
+
+    --muted: 286 50% 95%;
+    --muted-foreground: 285 25% 45%;
+
+    /* #8D4DB8 — medium violet */
+    --accent: 280 44% 51%;
+    --accent-foreground: 0 0% 100%;
+
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 210 40% 98%;
+
+    --border: 286 30% 88%;
+    --input: 286 30% 88%;
+    --ring: 285 77% 29%;
+
+    --radius: 0.75rem;
+
+    --sidebar-background: 286 60% 98%;
+    --sidebar-foreground: 285 25% 40%;
+    --sidebar-primary: 285 77% 29%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 286 50% 93%;
+    --sidebar-accent-foreground: 285 60% 8%;
+    --sidebar-border: 286 30% 88%;
+    --sidebar-ring: 285 77% 29%;
+
+    --surface: 0 0% 100%;
+    --surface-hover: 286 60% 98%;
+    --glow-primary: 285 77% 29%;
+    --success: 152 70% 50%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    font-family: 'Inter', sans-serif;
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    font-family: 'Space Grotesk', sans-serif;
+  }
+}
+
+@layer components {
+  /* #5F1284 glow utilities */
+  .glow-purple {
+    box-shadow: 0 0 20px hsl(285 77% 29% / 0.2), 0 0 40px hsl(285 77% 29% / 0.08);
+  }
+
+  .glow-purple-sm {
+    box-shadow: 0 0 12px hsl(285 77% 29% / 0.18);
+  }
+
+  .glow-purple-border {
+    border-color: hsl(285 77% 29% / 0.5);
+    box-shadow: 0 0 15px hsl(285 77% 29% / 0.12), inset 0 0 15px hsl(285 77% 29% / 0.04);
+  }
+
+  .surface-card {
+    @apply bg-card rounded-xl border border-border shadow-sm;
+  }
+
+  .surface-elevated {
+    background: hsl(0 0% 100%);
+    @apply rounded-xl border border-border shadow-md;
+  }
+}
+@keyframes popIn {
+  0% { opacity: 0; transform: translateY(20px) scale(0.9); }
+  100% { opacity: 1; transform: translateY(0) scale(1); }
+}
+@keyframes fadeIn {
+  0% { opacity: 0; }
+  100% { opacity: 1; }
+}
