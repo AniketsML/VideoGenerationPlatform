@@ -1,9 +1,10 @@
 import json
+import os
 from pymongo import MongoClient
 from bson.objectid import ObjectId
 import datetime
 
-client = MongoClient("mongodb+srv://admin:admin@cluster0.knt2i.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
+client = MongoClient(os.environ["MONGODB_URI"])
 db = client.get_database("video_generator")
 videos = db.videos
 

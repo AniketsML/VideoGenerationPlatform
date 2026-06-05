@@ -141,7 +141,7 @@ function buildVideoLinkPreview(
   mode: "personalized" | "universal",
   referenceVideoUrl?: string | null,
 ): string {
-  const origin = typeof window !== "undefined" ? window.location.origin : "https://vishvarupa.credresolve.com";
+  const origin = typeof window !== "undefined" ? window.location.origin : "";
   const csvVideoUrl =
     getRowValue(row, headers, mapping, "video_url")
     || getRowValue(row, headers, mapping, "final_video_url")

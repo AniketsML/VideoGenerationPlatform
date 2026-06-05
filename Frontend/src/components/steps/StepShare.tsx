@@ -76,10 +76,10 @@ export function StepShare({ state, update }: StepShareProps) {
   let downloadUrl = state.styledVideoUrl || generatedVideo?.video_url || "";
   
   if (shareUrl.startsWith("/api/artifacts/")) {
-    shareUrl = shareUrl.replace("/api/artifacts/", "https://vishvarupa.s3.ap-south-1.amazonaws.com/");
+    shareUrl = toAbsoluteShareUrl(shareUrl);
   }
   if (downloadUrl.startsWith("/api/artifacts/")) {
-    downloadUrl = downloadUrl.replace("/api/artifacts/", "https://vishvarupa.s3.ap-south-1.amazonaws.com/");
+    downloadUrl = toAbsoluteShareUrl(downloadUrl);
   }
   shareUrl = toAbsoluteShareUrl(shareUrl);
   const avatarName =

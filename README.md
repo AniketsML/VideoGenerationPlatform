@@ -52,7 +52,7 @@ Deploying the heavy Text-To-Video `Remotion` pipeline and HeyGen integrations re
 - **AWS SQS:** The API leverages an AWS SQS queue to handle asynchronous tasks. Both Avatar and Remotion messages are submitted here.
 - **Dual Polling Workers:** The server spins up `AvatarJobWorker` and `RemotionJobWorker` natively. The UI relies on the HTTP POST endpoint blocking securely until the worker uploads the finished artifact, triggering the real-time "progress bar" flawlessly.
 - **Scalability:** Workers strictly process massive Chromium rendering tasks (`npx remotion render`) sequentially (one-by-one). This specifically protects the EC2 vCPU cores from failing or entering race conditions globally.
-- **AWS S3:** Once artifacts are produced locally by the background queue, they are uploaded swiftly to AWS S3 (`vishvarupa` bucket) and shared via permanent URLs.
+- **AWS S3:** Once artifacts are produced locally by the background queue, they are uploaded swiftly to AWS S3 and shared via permanent URLs.
 
 ## Repo Layout
 

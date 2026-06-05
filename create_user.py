@@ -1,11 +1,12 @@
 import asyncio
+import os
 import sys
 from app.database import users_collection
 from app.auth import get_password_hash
 
 async def create_user():
-    email = "aniket@gmail.com"
-    password = "12345"
+    email = os.environ.get("ADMIN_EMAIL", "admin@example.com")
+    password = os.environ.get("ADMIN_PASSWORD", "changeme")
     normalized_email = email.strip().lower()
     
     print(f"Checking if user {normalized_email} exists...")
@@ -24,10 +25,10 @@ async def create_user():
     hashed_password = get_password_hash(password)
     user_dict = {
         "email": normalized_email,
-        "full_name": "Aniket",
-        "username": "aniket",
+        "full_name": os.environ.get("ADMIN_FULL_NAME", "Admin"),
+        "username": os.environ.get("ADMIN_USERNAME", "admin"),
         "hashed_password": hashed_password,
-        "is_admin": True # Make them admin just in case
+        "is_admin": True
     }
     
     await users_collection.insert_one(user_dict)
